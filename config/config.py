@@ -9,6 +9,8 @@ load_dotenv()
 
 # OpenAI API Configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+# SMWU FACTCHAT API Configuration
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 
 # API Rate Limiting Configuration
 CALLS_PER_MINUTE = 20

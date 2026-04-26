@@ -4,9 +4,27 @@ result/
 
 # Environment variables
 .env
+.venv/
+venv/
 
 # Editor and Cache files
 .vscode/
 .DS_Store
+
+# Python
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Cache
 cache/
+
+# Model files
+*.pt
+*.bin
+*.safetensors
+
+# Jupyter
+.ipynb_checkpoints/

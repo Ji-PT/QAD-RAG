@@ -11,6 +11,7 @@ from typing import List, Dict, Any
 from colorama import Fore, Style, init
 from config.config import (
     OPENAI_API_KEY,
+    OPENAI_BASE_URL,
     DEFAULT_MODEL,
     DEFAULT_MAX_TOKENS,
     CALLS_PER_MINUTE,
@@ -30,7 +31,10 @@ logger = logging.getLogger(__name__)
 TOKEN_COST = {"prompt": 0, "completion": 0}
 
 # Configure OpenAI
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    **({"base_url": OPENAI_BASE_URL} if OPENAI_BASE_URL else {})
+)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 REFLECTION_PROMPT = """Based on the question and the retrieved context, analyze:
