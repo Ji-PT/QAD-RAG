@@ -19,7 +19,7 @@ MAX_RETRIES = 3
 RETRY_DELAY = 120
 
 # Model Configuration
-DEFAULT_MODEL = "gpt-4o-mini"  # please specify your preferred LLM model
+DEFAULT_MODEL = "gpt-5.4-mini"  # please specify your preferred LLM model
 DEFAULT_MAX_TOKENS = 250
 
 # Embedding Configuration
