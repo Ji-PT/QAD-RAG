@@ -1,11 +1,8 @@
+import copy
 import json
 import logging
-import pdb
-import time
 from typing import List, Dict, Tuple, Any
-
 from src.models.base_rag import BaseRAG
-from src.models.query_logic_dag import QueryLogicDAGBuilder
 from src.utils.utils import get_response_with_retry, fix_json_response
 from colorama import Fore, Style, init
 
@@ -13,7 +10,6 @@ from colorama import Fore, Style, init
 init()
 
 logging.basicConfig(level=logging.INFO)
-
 logger = logging.getLogger(__name__)
 
 # [추가] Few-shot 예시 상수 (논문 Section 3.2)
@@ -57,24 +53,30 @@ Subproblems:
 
 
 class LogicRAG(BaseRAG):
-    
-    def __init__(self, corpus_path: str = None, cache_dir: str = "./cache", filter_repeats: bool = False):
+    def __init__(
+        self, 
+        corpus_path: str = None, 
+        cache_dir: str = "./cache",
+        filter_repeats: bool = False
+        ):
         """Initialize the LogicRAG system."""
         super().__init__(corpus_path, cache_dir)
-        self.max_rounds = 3  # Default max rounds for iterative retrieval
+
+        self.max_rounds = 3  # agentic iterative retrieval의 최대 round 수
         self.MODEL_NAME = "LogicRAG"
         self.filter_repeats = filter_repeats  # Option to filter repeated chunks across rounds
 
-        # Query decomposition 담당자가 만든 decompose_query()의 결과인 subproblems를
-        # Query Logic DAG G=(V,E)로 변환하기 위한 Builder.
-        #
-        # 여기서는 decomposition["subproblems"]를 DAG Builder에 연결하는 역할만 한다.
-        
+        # Query decomposition 담당자가 만든 decompose_query()의 결과인 subproblems를 Query Logic DAG G=(V,E)로 변환하기 위한 Builder.
+        # 여기서는 decomposition["subproblems"]를 DAG Builder에 연결하는 역할만 한다.     
         self.dag_builder = QueryLogicDAGBuilder()
 
         # 마지막으로 생성된 Query Logic DAG를 평가/디버깅용으로 저장한다.
-        self.last_query_logic_dag = None
-    
+        self.last_query_logic_dag = None    
+
+        # DAG verification / repair settings
+        self.max_dag_repair_attempts = 1
+        self.dag_cycle_policy = "raise"  # "raise" or "fallback" 
+
     def set_max_rounds(self, max_rounds: int):
         """Set the maximum number of retrieval rounds."""
         self.max_rounds = max_rounds
@@ -388,53 +390,313 @@ Ans: """
         # Step 2: use graph-based algorithm to sort the dependencies in a topological order
         sorted_dependencies = self._topological_sort(dependencies, dependency_pairs)
         return sorted_dependencies
+    
+    @staticmethod
+    def _get_dag_node_edge_keys(dag_dict: Dict[str, Any]) -> Tuple[str, str]:
+        """
+        DAG dict에서 node field와 edge field 이름 찾기
+        지원 형식:
+        1. {"nodes": ..., "edges": ...}
+        2. {"V": ..., "E": ...}
+        """
+        if "nodes" in dag_dict and "edges" in dag_dict:
+            return "nodes", "edges"
+
+        if "V" in dag_dict and "E" in dag_dict:
+            return "V", "E"
+
+        raise ValueError("DAG dict must have either nodes/edges or V/E.")
+
 
     @staticmethod
-    def _topological_sort(dependencies: List[str], dependencies_pairs: List[Tuple[int, int]]) -> List[str]:
+    def _nodes_payload_from_dag_dict(dag_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        Use graph-based algorithm to sort the dependencies in a topological order.
-
-        Args:
-            dependencies: List[str]
-            dependencies_pairs: List[Tuple[int, int]]
-
-        Returns:
-            List[str]
-
-        Note:
-            QueryLogicDAG uses edges in the direction:
-                prerequisite_id -> dependent_id
-
-            This legacy sorter expects pairs in the format:
-                (dependent_idx, dependency_idx)
-
-            Therefore, QueryLogicDAG.to_legacy_dependency_pairs() is used before
-            calling this method.
+        LLM repair prompt용 node 리스트 생성
         """
-        graph = {dep: [] for dep in dependencies}
-        
-        for dependent_idx, dependency_idx in dependencies_pairs:
-            if dependent_idx < len(dependencies) and dependency_idx < len(dependencies):
-                dependent = dependencies[dependent_idx]
-                dependency = dependencies[dependency_idx]
-                graph[dependency].append(dependent)  # dependency -> dependent
-        
-        visited = set()
-        stack = []
-        
-        def dfs(node):
-            if node in visited:
-                return
-            visited.add(node)
-            for neighbor in graph[node]:
-                dfs(neighbor)
-            stack.append(node)
+        node_key, _ = LogicRAG._get_dag_node_edge_keys(dag_dict)
+        raw_nodes = dag_dict[node_key]
 
-        for node in graph:
-            if node not in visited:
-                dfs(node)
-        
-        return stack[::-1]
+        nodes_payload = []
+
+        for raw_key, raw_node in raw_nodes.items():
+            if not isinstance(raw_node, dict):
+                continue
+
+            try:
+                node_id = int(raw_node.get("id", raw_key))
+            except (TypeError, ValueError):
+                continue
+
+            text = raw_node.get("text", "")
+
+            nodes_payload.append({
+                "id": node_id,
+                "text": text,
+            })
+
+        return sorted(nodes_payload, key=lambda item: item["id"])
+
+
+    @staticmethod
+    def _rebuild_dag_indexes_dict(dag_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        LLM이 edge를 수정하면 parents / children 다시 계산
+
+        verify_non_cyclicity.py는 parents / children을 직접 쓰지 않지만,
+        logging/history의 DAG 일관성을 위해 갱신
+        """
+        node_key, edge_key = LogicRAG._get_dag_node_edge_keys(dag_dict)
+
+        raw_nodes = dag_dict[node_key]
+        raw_edges = dag_dict[edge_key]
+
+        node_ids = []
+
+        for raw_key, raw_node in raw_nodes.items():
+            if not isinstance(raw_node, dict):
+                continue
+
+            try:
+                node_id = int(raw_node.get("id", raw_key))
+            except (TypeError, ValueError):
+                continue
+
+            node_ids.append(node_id)
+
+        node_id_set = set(node_ids)
+
+        parents = {node_id: set() for node_id in node_ids}
+        children = {node_id: set() for node_id in node_ids}
+
+        for edge in raw_edges:
+            if not isinstance(edge, dict):
+                continue
+
+            try:
+                pre = int(edge["prerequisite_id"])
+                dep = int(edge["dependent_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            if pre not in node_id_set or dep not in node_id_set:
+                continue
+
+            if pre == dep:
+                continue
+
+            children[pre].add(dep)
+            parents[dep].add(pre)
+
+        dag_dict["parents"] = {
+            node_id: sorted(list(parent_ids))
+            for node_id, parent_ids in parents.items()
+        }
+
+        dag_dict["children"] = {
+            node_id: sorted(list(child_ids))
+            for node_id, child_ids in children.items()
+        }
+
+        return dag_dict
+
+
+    def _repair_cyclic_dag_with_llm(
+        self,
+        question: str,
+        dag_dict: Dict[str, Any],
+        dag_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        cycle 있는 DAG → LLM에게 고쳐달라고 요청
+
+        - 이 함수에서는 DAG 검증을 하지 않고, repaired edge set을 포함한 DAG dict만 반환한다.
+        - 검증은 _verify_sort_dependencies_with_repair()에서 다시 수행
+        """
+        _, edge_key = self._get_dag_node_edge_keys(dag_dict)
+
+        nodes_payload = self._nodes_payload_from_dag_dict(dag_dict)
+        current_edges = dag_result.get("valid_dependency_edges") or dag_dict.get(edge_key, [])
+
+        cycle_node_ids = dag_result.get("cycle_node_ids", [])
+        cycle_dependencies = dag_result.get("cycle_dependencies", [])
+        blocked_node_ids = dag_result.get("blocked_node_ids", [])
+
+        prompt = f"""
+You are repairing the edge set of a Query Logic Dependency Graph.
+
+Original question:
+{question}
+
+Subproblem nodes:
+{json.dumps(nodes_payload, ensure_ascii=False, indent=2)}
+
+Current directed edges:
+{json.dumps(current_edges, ensure_ascii=False, indent=2)}
+
+Detected cycle node ids:
+{json.dumps(cycle_node_ids, ensure_ascii=False)}
+
+Detected cycle subproblems:
+{json.dumps(cycle_dependencies, ensure_ascii=False, indent=2)}
+
+Blocked node ids:
+{json.dumps(blocked_node_ids, ensure_ascii=False)}
+
+Task:
+Repair the edge set so that the graph becomes a valid DAG.
+
+Rules:
+- Use only node ids from the provided subproblem nodes.
+- Edge direction must be prerequisite_id -> dependent_id.
+- Do not create self-loops.
+- Remove or modify the minimum number of edges needed to break cycles.
+- Preserve necessary logical dependencies when possible.
+- Do not add redundant transitive edges.
+- Each edge must include a short reason.
+- Return ONLY a JSON object.
+
+Output schema:
+{{
+  "edges": [
+    {{
+      "prerequisite_id": integer,
+      "dependent_id": integer,
+      "reason": string
+    }}
+  ]
+}}
+"""
+
+        try:
+            response = get_response_with_retry(prompt)
+            response = response.strip()
+            response = response.replace("```json", "").replace("```", "")
+
+            repaired = fix_json_response(response)
+
+            if not isinstance(repaired, dict) or not isinstance(repaired.get("edges"), list):
+                logger.error(
+                    f"{Fore.RED}Failed to parse repaired DAG edges. "
+                    f"Using original DAG for re-verification.{Style.RESET_ALL}"
+                )
+                return copy.deepcopy(dag_dict)
+
+            repaired_edges = []
+
+            for edge in repaired["edges"]:
+                if not isinstance(edge, dict):
+                    continue
+
+                try:
+                    prerequisite_id = edge["prerequisite_id"]
+                    dependent_id = edge["dependent_id"]
+
+                    if isinstance(prerequisite_id, bool) or isinstance(dependent_id, bool):
+                        continue
+
+                    repaired_edges.append({
+                        "prerequisite_id": int(prerequisite_id),
+                        "dependent_id": int(dependent_id),
+                        "reason": edge.get("reason", ""),
+                    })
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+            repaired_dag_dict = copy.deepcopy(dag_dict)
+            repaired_dag_dict[edge_key] = repaired_edges
+            repaired_dag_dict = self._rebuild_dag_indexes_dict(repaired_dag_dict)
+
+            return repaired_dag_dict
+
+        except Exception as e:
+            logger.error(f"{Fore.RED}Error during DAG repair: {e}{Style.RESET_ALL}")
+            return copy.deepcopy(dag_dict)
+
+
+    def _verify_sort_dependencies_with_repair(
+        self,
+        question: str,
+        dag_dict: Dict[str, Any],
+        max_repair_attempts: int = 1,
+        on_repair_failure: str = "raise",
+    ) -> Tuple[List[str], Dict[str, Any], List[Dict[str, Any]]]:
+        """
+        DAG 검증 + topological sort + cycle repair orchestration
+
+        1. verify_non_cyclicity로 DAG 검증
+        2. cycle 없으면 sorted_dependencies 반환
+        3. cycle 있으면 LLM에게 targeted repair 요청
+        4. repaired DAG를 다시 verify_non_cyclicity로 검증
+        5. 그래도 cycle이면 policy에 따라 raise or fallback
+        """
+        if on_repair_failure not in {"raise", "fallback"}:
+            raise ValueError("on_repair_failure must be either 'raise' or 'fallback'.")
+
+        verification_history = []
+        current_dag_dict = copy.deepcopy(dag_dict)
+
+        dag_result = verify_dag_and_topological_sort(current_dag_dict)
+
+        verification_history.append({
+            "attempt": 0,
+            "type": "initial_verification",
+            "dag": current_dag_dict,
+            "dag_verification": dag_result,
+        })
+
+        if dag_result["is_dag"]:
+            return dag_result["sorted_dependencies"], current_dag_dict, verification_history
+
+        if not dag_result.get("has_cycle", False):
+            if on_repair_failure == "fallback":
+                fallback_dependencies = build_partial_order_fallback(dag_result)
+                return fallback_dependencies, current_dag_dict, verification_history
+
+            raise ValueError(
+                f"Invalid DAG input. invalid_edges={dag_result.get('invalid_edges', [])}"
+            )
+
+        for attempt in range(1, max_repair_attempts + 1):
+            logger.warning(
+                f"{Fore.YELLOW}Cycle detected in Query Logic DAG. "
+                f"Attempting LLM repair {attempt}/{max_repair_attempts}.{Style.RESET_ALL}"
+            )
+
+            repaired_dag_dict = self._repair_cyclic_dag_with_llm(
+                question=question,
+                dag_dict=current_dag_dict,
+                dag_result=dag_result,
+            )
+
+            repaired_result = verify_dag_and_topological_sort(repaired_dag_dict)
+
+            verification_history.append({
+                "attempt": attempt,
+                "type": "llm_repair_verification",
+                "dag": repaired_dag_dict,
+                "dag_verification": repaired_result,
+            })
+
+            current_dag_dict = repaired_dag_dict
+            dag_result = repaired_result
+
+            if dag_result["is_dag"]:
+                logger.info(f"{Fore.GREEN}DAG repair succeeded.{Style.RESET_ALL}")
+                return dag_result["sorted_dependencies"], current_dag_dict, verification_history
+
+            if not dag_result.get("has_cycle", False):
+                break
+
+        if on_repair_failure == "fallback":
+            logger.warning(
+                f"{Fore.YELLOW}DAG repair failed. "
+                f"Using partial-order fallback.{Style.RESET_ALL}"
+            )
+            fallback_dependencies = build_partial_order_fallback(dag_result)
+            return fallback_dependencies, current_dag_dict, verification_history
+
+        raise DependencyGraphCycleError(dag_result)
+
 
     def _retrieve_with_filter(self, query: str, retrieved_chunks_set: set) -> list:
         """
