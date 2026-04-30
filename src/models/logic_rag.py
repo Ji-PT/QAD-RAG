@@ -16,43 +16,40 @@ logger = logging.getLogger(__name__)
 
 # [추가] Few-shot 예시 상수 (논문 Section 3.2)
 # decompose_query()의 프롬프트에서 참조
+# subproblems 형식: {"id", "text"} → QueryLogicDAGBuilder 입력 형식에 맞춤
 QUERY_DECOMPOSITION_FEW_SHOT_EXAMPLES = """
 Example 1:
 Question: "Who is the mayor of the capital of France?"
 Subproblems:
 [
-  "What is the capital of France?",
-  "Who is the mayor of this capital city?"
+  {"id": 0, "text": "What is the capital of France?"},
+  {"id": 1, "text": "Who is the mayor of this capital city?"}
 ]
-Dependency pairs: [[1, 0]]
 
 Example 2:
 Question: "When was the director of 'Inception' born, and what award did the film win at the Oscars?"
 Subproblems:
 [
-  "Who directed the film 'Inception'?",
-  "When was this director born?",
-  "What award did 'Inception' win at the Oscars?"
+  {"id": 0, "text": "Who directed the film 'Inception'?"},
+  {"id": 1, "text": "When was this director born?"},
+  {"id": 2, "text": "What award did 'Inception' win at the Oscars?"}
 ]
-Dependency pairs: [[1, 0]]
 
 Example 3:
 Question: "What is the population of the country where the inventor of the telephone was born?"
 Subproblems:
 [
-  "Who invented the telephone?",
-  "In which country was this inventor born?",
-  "What is the population of this country?"
+  {"id": 0, "text": "Who invented the telephone?"},
+  {"id": 1, "text": "In which country was this inventor born?"},
+  {"id": 2, "text": "What is the population of this country?"}
 ]
-Dependency pairs: [[1, 0], [2, 1]]
 
 Example 4:
 Question: "What is the tallest building in Tokyo?"
 Subproblems:
 [
-  "What is the tallest building in Tokyo?"
+  {"id": 0, "text": "What is the tallest building in Tokyo?"}
 ]
-Dependency pairs: []
 """
 
 
@@ -219,28 +216,26 @@ Please format your response as a JSON object with these keys:
 
     # [추가] 논문 Section 3.2 - Query Decomposition Prompting
     # subproblem 분해 + Few-shot prompting을 하나의 Task로 합침
-    # warm_up_analysis()를 대체하며, subproblems와 dependency_pairs를 한 번의 LLM 호출로 추출
+    # 출력된 subproblems는 QueryLogicDAGBuilder.construct_from_subproblems()의 input으로 전달됨
     def decompose_query(self, question: str) -> Dict:
         """
-        Decompose the input query into subproblems and extract dependency pairs using few-shot prompting.
-        subproblems and dependency_pairs are extracted in a single LLM call.
+        Decompose the input query into subproblems using few-shot prompting.
+        Output subproblems are passed to QueryLogicDAGBuilder.construct_from_subproblems().
 
         Args:
             question: The original question
 
         Returns:
             Dictionary with:
-                - "subproblems": List[str]
-                - "dependency_pairs": List[List[int]]
+                - "subproblems": List[Dict]  # [{"id": int, "text": str}, ...]
                 - "is_simple": bool
         """
         try:
             prompt = f"""You are an expert at decomposing complex questions into smaller, logically ordered subproblems.
 
 Given a question, you must:
-1. Decompose the question into a minimal set of subproblems.
-2. Identify dependency pairs: if answering subproblem i requires the answer of subproblem j, output [i, j].
-3. If the question is simple (single-hop, no decomposition needed), output a single subproblem identical to the original question with no dependency pairs.
+1. Decompose the question into a minimal set of subproblems. Each subproblem must have an "id" (integer, starting from 0) and a "text" (the subproblem question string).
+2. If the question is simple (single-hop, no decomposition needed), output a single subproblem identical to the original question.
 
 Here are some examples:
 {QUERY_DECOMPOSITION_FEW_SHOT_EXAMPLES}
@@ -249,8 +244,7 @@ Now decompose the following question:
 Question: "{question}"
 
 Please format your response as a JSON object with these keys:
-- "subproblems": list of strings
-- "dependency_pairs": list of [int, int] pairs
+- "subproblems": list of objects, each with "id" (int) and "text" (string)
 - "is_simple": boolean
 
 Respond ONLY with the JSON object, no additional text."""
@@ -264,13 +258,11 @@ Respond ONLY with the JSON object, no additional text."""
             result = fix_json_response(response)
 
             if result is None:
-                return {"subproblems": [question], "dependency_pairs": [], "is_simple": True}
+                return {"subproblems": [{"id": 0, "text": question}], "is_simple": True}
 
             # Validate required fields
             if "subproblems" not in result or not isinstance(result["subproblems"], list) or len(result["subproblems"]) == 0:
-                result["subproblems"] = [question]
-            if "dependency_pairs" not in result or not isinstance(result["dependency_pairs"], list):
-                result["dependency_pairs"] = []
+                result["subproblems"] = [{"id": 0, "text": question}]
             if "is_simple" not in result:
                 result["is_simple"] = len(result["subproblems"]) <= 1
 
@@ -278,7 +270,7 @@ Respond ONLY with the JSON object, no additional text."""
 
         except Exception as e:
             logger.error(f"{Fore.RED}Error in decompose_query: {e}{Style.RESET_ALL}")
-            return {"subproblems": [question], "dependency_pairs": [], "is_simple": True}
+            return {"subproblems": [{"id": 0, "text": question}], "is_simple": True}
 
     def dependency_aware_rag(self, question: str, info_summary: str, dependencies: List[str], idx: int) -> str:
         """
@@ -351,8 +343,7 @@ Ans: """
             logger.error(f"{Fore.RED}Error generating answer: {e}{Style.RESET_ALL}")
             return ""
 
-    def _sort_dependencies(self, dependencies: List[str], query,
-                           dependency_pairs: List[List[int]] = None) -> List[Tuple]:  # [수정] dependency_pairs 파라미터 추가
+    def _sort_dependencies(self, dependencies: List[str], query) -> List[Tuple]:
         """
         given a list of dependencies and the original query,
         sort the dependencies in a topological order, that is solving a dependency A relies on the solution of the dependent dependency B,
@@ -394,24 +385,23 @@ Ans: """
         - The mayor of this capital
         """
 
-        # [수정] decompose_query()에서 이미 추출한 dependency_pairs가 있으면 LLM 호출을 건너뜀
-        if dependency_pairs is None:
-            # Step 1: generate the dependency pairs by prompting LLMs
-            prompt = f"""
-            Given the question:
-            Question: {query}
 
-            and its decomposed dependencies:
-            Dependencies: {dependencies}
+        # Step 1: generate the dependency pairs by prompting LLMs
+        prompt = f"""
+        Given the question:
+        Question: {query}
 
-            Please output the dependency pairs that dependency A relies on dependency B, if any. If no dependency pairs are found, output an empty list.
+        and its decomposed dependencies:
+        Dependencies: {dependencies}
 
-            format your response as a JSON object with these keys:
-            - "dependency_pairs": list of tuples of integers
-            """
-            response = get_response_with_retry(prompt)
-            result = fix_json_response(response)
-            dependency_pairs = result["dependency_pairs"]
+        Please output the dependency pairs that dependency A relies on dependency B, if any. If no dependency pairs are found, output an empty list.
+
+        format your response as a JSON object with these keys:
+        - "dependency_pairs": list of tuples of integers
+        """
+        response = get_response_with_retry(prompt)
+        result = fix_json_response(response)
+        dependency_pairs = result["dependency_pairs"]
 
         # Step 2: use graph-based algorithm to sort the dependencies in a topological order
         sorted_dependencies = self._topological_sort(dependencies, dependency_pairs)
@@ -503,8 +493,8 @@ Ans: """
             info_summary
         )
 
-        # [수정] warm_up_analysis() 대신 decompose_query()를 사용
-        # subproblem 분해 + dependency_pairs 추출을 하나의 LLM 호출로 처리 (논문 Section 3.2)
+        # [수정] warm_up_analysis() 대신 decompose_query()를 사용 (논문 Section 3.2)
+        # subproblems는 이후 QueryLogicDAGBuilder.construct_from_subproblems()의 input으로 전달됨
         decomposition = self.decompose_query(question)
 
         if decomposition["is_simple"]:
@@ -518,13 +508,11 @@ Ans: """
             logger.info(f"Query decomposition result: {len(decomposition['subproblems'])} subproblems detected.")
             logger.info(f"Subproblems: {decomposition['subproblems']}")
 
+            # [수정] subproblems에서 text만 추출하여 기존 _sort_dependencies()에 전달
+            subproblem_texts = [sp["text"] for sp in decomposition["subproblems"]]
+
             # sort the dependencies, by first constructing the dependency graphs, then use topological sort to get the sorted dependencies
-            # [수정] decompose_query()에서 받은 dependency_pairs를 직접 전달하여 LLM 중복 호출 방지
-            sorted_dependencies = self._sort_dependencies(
-                decomposition["subproblems"],
-                question,
-                dependency_pairs=decomposition["dependency_pairs"]
-            )
+            sorted_dependencies = self._sort_dependencies(subproblem_texts, question)
             dependency_analysis_history.append({"sorted_dependencies": sorted_dependencies})
             logger.info(f"Sorted dependencies: {sorted_dependencies}\n\n")
         #===============================================
