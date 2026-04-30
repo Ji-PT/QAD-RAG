@@ -58,7 +58,7 @@ class LogicRAG(BaseRAG):
         corpus_path: str = None, 
         cache_dir: str = "./cache",
         filter_repeats: bool = False
-        ):
+    ):
         """Initialize the LogicRAG system."""
         super().__init__(corpus_path, cache_dir)
 
@@ -758,7 +758,6 @@ Output schema:
             # In this case, the question can be answered with simple fact retrieval, without any dependency analysis
             print("Query decomposition indicates a simple single-hop question. Answering directly.")
             answer = self.generate_answer(question, info_summary)
-            # Reset dependency analysis history for simple questions
             self.last_dependency_analysis = []
             self.last_query_logic_dag = None
             return answer, last_contexts, round_count
@@ -778,30 +777,42 @@ Output schema:
                 subproblems=decomposition["subproblems"],
             )
 
-            # 생성된 DAG를 평가/디버깅용으로 저장한다.
-            self.last_query_logic_dag = dag
+        # ===============================================
+        # == Stage 2: DAG 구축
+        # 생성된 DAG를 평가/디버깅용으로 저장한다.
+        self.last_query_logic_dag = dag
 
-            dependency_analysis_history.append({
-                "query_logic_dag": dag.to_dict()
-            })
-            logger.info(f"Constructed Query Logic DAG: {dag.to_dict()}\n\n")
+        dag_dict = dag.to_dict()
 
-            # 기존 retrieval loop와 연결하기 위한 임시 호환 경로.
-            #
-            # QueryLogicDAG edge 방향:
-            #   prerequisite_id -> dependent_id
-            #
-            # 기존 _topological_sort() 입력 형식:
-            #   (dependent_idx, dependency_idx)
-            #
-            # 따라서 DAG edge를 기존 pair 형식으로 변환한 뒤 topological sort를 수행한다.
-            sorted_dependencies = self._topological_sort(
-                dag.node_texts_in_id_order(),
-                dag.to_legacy_dependency_pairs(),
+        dependency_analysis_history.append({
+            "query_logic_dag": dag_dict,
+        })
+        logger.info(f"Constructed Query Logic DAG: {dag_dict}\n\n")
+
+        # ===============================================
+        # == Stage 3: DAG tological sort + cycle verification ==
+
+        sorted_dependencies, verified_dag_dict, dag_verification_history = (
+            self._verify_sort_dependencies_with_repair(
+                question=question,
+                dag_dict=dag_dict,
+                max_repair_attempts=self.max_dag_repair_attempts,
+                on_repair_failure=self.dag_cycle_policy,
             )
+        )
 
-            dependency_analysis_history[-1]["sorted_dependencies"] = sorted_dependencies
-            logger.info(f"Sorted dependencies: {sorted_dependencies}\n\n")
+        self.last_query_logic_dag_dict = verified_dag_dict
+
+        dependency_analysis_history.append({
+            "query_logic_dag": dag_dict,
+            "verified_query_logic_dag": verified_dag_dict,
+            "dag_verification_history": dag_verification_history,
+            "sorted_dependencies": sorted_dependencies,
+        })
+
+        logger.info(f"Verified Query Logic DAG: {verified_dag_dict}\n\n")
+        logger.info(f"Sorted dependencies: {sorted_dependencies}\n\n")
+
 
         #===============================================
         #== Stage 2: agentic iterative retrieval ==
