@@ -3,7 +3,9 @@ import logging
 import pdb
 import time
 from typing import List, Dict, Tuple, Any
+
 from src.models.base_rag import BaseRAG
+from src.models.query_logic_dag import QueryLogicDAGBuilder
 from src.utils.utils import get_response_with_retry, fix_json_response
 from colorama import Fore, Style, init
 
@@ -53,6 +55,7 @@ Subproblems:
 """
 
 
+
 class LogicRAG(BaseRAG):
     
     def __init__(self, corpus_path: str = None, cache_dir: str = "./cache", filter_repeats: bool = False):
@@ -61,6 +64,16 @@ class LogicRAG(BaseRAG):
         self.max_rounds = 3  # Default max rounds for iterative retrieval
         self.MODEL_NAME = "LogicRAG"
         self.filter_repeats = filter_repeats  # Option to filter repeated chunks across rounds
+
+        # Query decomposition 담당자가 만든 decompose_query()의 결과인 subproblems를
+        # Query Logic DAG G=(V,E)로 변환하기 위한 Builder.
+        #
+        # 여기서는 decomposition["subproblems"]를 DAG Builder에 연결하는 역할만 한다.
+        
+        self.dag_builder = QueryLogicDAGBuilder()
+
+        # 마지막으로 생성된 Query Logic DAG를 평가/디버깅용으로 저장한다.
+        self.last_query_logic_dag = None
     
     def set_max_rounds(self, max_rounds: int):
         """Set the maximum number of retrieval rounds."""
@@ -345,46 +358,15 @@ Ans: """
 
     def _sort_dependencies(self, dependencies: List[str], query) -> List[Tuple]:
         """
-        given a list of dependencies and the original query,
-        sort the dependencies in a topological order, that is solving a dependency A relies on the solution of the dependent dependency B,
-        then B should be before A in the sorted string.
+        Legacy dependency sorting method.
 
-        Args:
-            dependencies: List[str]
-            query: str
+        Given a list of dependencies and the original query, this method asks the LLM
+        to infer dependency pairs, then applies graph-based topological sorting.
 
-            
-        For example, if the question is "What is the mayor of the capital of France?",
-        the input dependencies for this question are:
-        - The capital of France
-        - The mayor of this capital
-
-        Then the output should be:
-        - The capital of France
-        - The mayor of this capital
-
-        there are two steps to solve this problem:
-        1. generate the dependency pairs that dependency A relies on dependency B
-        2. use graph-based algorithm to sort the dependencies in a topological order
-
-        For example, answering the question "What is the mayor of the capital of France?"
-        the input dependencies are:
-        - The capital of France
-        - The mayor of this capital
-
-        Then the dependency pairs are:
-        - [(1, 0)]
-        because the mayor of the capital of France relies on the capital of France
-
-        Then the topological order is computed by the self._topological_sort function, which is a graph-based algorithm. The output is a list of indices of the dependencies in the topological order.
-        In this case, the output is:
-        [0, 1]
-
-        The sorted dependencies are thus:
-        - The capital of France
-        - The mayor of this capital
+        This method is kept for backward compatibility and ablation testing.
+        The main path after merge should construct an explicit Query Logic DAG
+        from decomposition["subproblems"] before sorting.
         """
-
 
         # Step 1: generate the dependency pairs by prompting LLMs
         prompt = f"""
@@ -411,11 +393,23 @@ Ans: """
     def _topological_sort(dependencies: List[str], dependencies_pairs: List[Tuple[int, int]]) -> List[str]:
         """
         Use graph-based algorithm to sort the dependencies in a topological order.
+
         Args:
             dependencies: List[str]
             dependencies_pairs: List[Tuple[int, int]]
+
         Returns:
             List[str]
+
+        Note:
+            QueryLogicDAG uses edges in the direction:
+                prerequisite_id -> dependent_id
+
+            This legacy sorter expects pairs in the format:
+                (dependent_idx, dependency_idx)
+
+            Therefore, QueryLogicDAG.to_legacy_dependency_pairs() is used before
+            calling this method.
         """
         graph = {dep: [] for dep in dependencies}
         
@@ -496,25 +490,57 @@ Ans: """
         # [수정] warm_up_analysis() 대신 decompose_query()를 사용 (논문 Section 3.2)
         # subproblems는 이후 QueryLogicDAGBuilder.construct_from_subproblems()의 input으로 전달됨
         decomposition = self.decompose_query(question)
-
+        # Query decomposition 담당자가 dev 브랜치에 추가한 decompose_query()를 사용한다.
+       
         if decomposition["is_simple"]:
             # In this case, the question can be answered with simple fact retrieval, without any dependency analysis
-            print(f"Query decomposition indicates a simple single-hop question. Answering directly.")
+            print("Query decomposition indicates a simple single-hop question. Answering directly.")
             answer = self.generate_answer(question, info_summary)
             # Reset dependency analysis history for simple questions
             self.last_dependency_analysis = []
+            self.last_query_logic_dag = None
             return answer, last_contexts, round_count
         else:
             logger.info(f"Query decomposition result: {len(decomposition['subproblems'])} subproblems detected.")
             logger.info(f"Subproblems: {decomposition['subproblems']}")
 
-            # [수정] subproblems에서 text만 추출하여 기존 _sort_dependencies()에 전달
-            subproblem_texts = [sp["text"] for sp in decomposition["subproblems"]]
+            # Query decompif decomposition["is_simple"]:Query decomposition  결과 P를 Query Logic DAG G=(V,E)로 변환한다.
+            #
+            # 논문 대응:
+            #   - 입력 query Q를 subproblem 집합 P로 분해한다.
+            #   - 각 subproblem p_i는 DAG의 node v_i가 된다.
+            #   - subproblem 사이의 logical dependency는 DAG의 edge E가 된다.
+            #   - edge는 QueryLogicDAGBuilder 내부에서 logical precedence 기준으로 추론한다.
+            dag = self.dag_builder.construct_from_subproblems(
+                question=question,
+                subproblems=decomposition["subproblems"],
+            )
 
-            # sort the dependencies, by first constructing the dependency graphs, then use topological sort to get the sorted dependencies
-            sorted_dependencies = self._sort_dependencies(subproblem_texts, question)
-            dependency_analysis_history.append({"sorted_dependencies": sorted_dependencies})
+            # 생성된 DAG를 평가/디버깅용으로 저장한다.
+            self.last_query_logic_dag = dag
+
+            dependency_analysis_history.append({
+                "query_logic_dag": dag.to_dict()
+            })
+            logger.info(f"Constructed Query Logic DAG: {dag.to_dict()}\n\n")
+
+            # 기존 retrieval loop와 연결하기 위한 임시 호환 경로.
+            #
+            # QueryLogicDAG edge 방향:
+            #   prerequisite_id -> dependent_id
+            #
+            # 기존 _topological_sort() 입력 형식:
+            #   (dependent_idx, dependency_idx)
+            #
+            # 따라서 DAG edge를 기존 pair 형식으로 변환한 뒤 topological sort를 수행한다.
+            sorted_dependencies = self._topological_sort(
+                dag.node_texts_in_id_order(),
+                dag.to_legacy_dependency_pairs(),
+            )
+
+            dependency_analysis_history[-1]["sorted_dependencies"] = sorted_dependencies
             logger.info(f"Sorted dependencies: {sorted_dependencies}\n\n")
+
         #===============================================
         #== Stage 2: agentic iterative retrieval ==
         idx = 0 # used to track the current dependency index
