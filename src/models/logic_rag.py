@@ -1,7 +1,8 @@
 import copy
 import json
 import logging
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
+
 from src.models.base_rag import BaseRAG
 from src.models.verify_non_cyclicity import (
     verify_dag_and_topological_sort,
@@ -344,6 +345,437 @@ Respond ONLY with the JSON object, no additional text."""
                 "can_answer": True,
                 "current_understanding": f"Error during analysis: {str(e)}",
             }
+
+
+    @staticmethod
+    def _deduplicate_nonempty_strings(items: List[Any]) -> List[str]:
+        """문자열 list를 정리하고 순서를 유지한 채 중복을 제거
+        - subproblem 리스트에서 빈 문자열, 비문자열, 중복 문장을 제거
+        - unified query 생성 전에 입력을 정리하는 전처리 역할
+        """
+        cleaned: List[str] = []
+        seen = set()
+
+        for item in items or []:
+            if not isinstance(item, str):
+                continue
+
+            text = item.strip()
+            if not text:
+                continue
+
+            key = text.lower()
+            if key in seen:
+                continue
+
+            seen.add(key)
+            cleaned.append(text)
+
+        return cleaned
+
+
+    def build_unified_query(
+        self,
+        question: str,
+        rank: int,
+        subproblems: List[str],
+    ) -> str:
+        """
+        - 같은 topological rank에 속한 여러 subquery를 하나의 unified retrieval query(q_r^u)로 합침
+        - subproblem이 1개면 LLM 호출 없이 그대로 사용
+        """
+        subproblems = self._deduplicate_nonempty_strings(subproblems)
+
+        if not subproblems:
+            return question
+
+        if len(subproblems) == 1:
+            return subproblems[0]
+
+        # LLM 응답 파싱이 실패하거나 unified_query가 비어 있으면 fallback query를 사용
+        fallback_query = (
+            f"For the original question '{question}', retrieve the facts needed to answer: "
+            + "; ".join(subproblems)
+        )
+
+        prompt = f"""
+You are merging same-rank subproblems in a Query Logic DAG into one retrieval query.
+
+Original question:
+{question}
+
+Topological rank:
+{rank}
+
+Same-rank subproblems:
+{json.dumps(subproblems, ensure_ascii=False, indent=2)}
+
+Task:
+Create ONE unified retrieval query that can retrieve evidence for all same-rank subproblems at once.
+
+Rules:
+- Preserve every entity, relation, date constraint, comparison target, and attribute requested.
+- Do not answer the subproblems.
+- Do not introduce new entities.
+- Prefer a concise factoid-style retrieval query.
+- Return ONLY a JSON object.
+
+Output schema:
+{{
+  "unified_query": string
+}}
+"""
+
+        try:
+            response = get_response_with_retry(prompt)
+            response = response.strip().replace("```json", "").replace("```", "")
+            parsed = fix_json_response(response)
+
+            if isinstance(parsed, dict):
+                unified_query = parsed.get("unified_query", "")
+                if isinstance(unified_query, str) and unified_query.strip():
+                    return unified_query.strip()
+
+        except Exception as e:
+            logger.error(f"{Fore.RED}Error generating unified query: {e}{Style.RESET_ALL}")
+
+        return fallback_query
+
+
+    def decompose_unified_context_by_subproblem(
+        self,
+        question: str,
+        rank: int,
+        subproblems: List[str],
+        unified_query: str,
+        contexts: List[str],
+        current_summary: str = "",
+    ) -> Dict[str, Any]:
+        """
+        - unified query로 가져온 retrieval context를 다시 개별 subproblem별 answer로 분해
+        - 이후 summary refinement와 history logging에 사용
+        """
+        subproblems = self._deduplicate_nonempty_strings(subproblems)
+        context_text = "\n\n".join(contexts or [])
+
+        fallback_answers = [
+            {
+                "subproblem": subproblem,
+                "answer": "",
+                "is_answered": False,
+                "evidence_summary": "",
+                "missing_info": "No parsed answer was produced.",
+            }
+            for subproblem in subproblems
+        ]
+
+        prompt = f"""
+You are decomposing a unified retrieval result back into answers for individual same-rank subproblems.
+
+Original question:
+{question}
+
+Current information summary before this rank:
+{current_summary}
+
+Topological rank:
+{rank}
+
+Same-rank subproblems:
+{json.dumps(subproblems, ensure_ascii=False, indent=2)}
+
+Unified retrieval query:
+{unified_query}
+
+Retrieved context for the unified query:
+{context_text}
+
+Task:
+For each same-rank subproblem, extract the relevant answer from the retrieved context.
+
+Rules:
+- Use only the retrieved context and the current summary.
+- Do not invent unsupported facts.
+- Keep each answer concise.
+- If the evidence is insufficient, set is_answered to false and explain missing_info.
+- Return one item for every subproblem in the same order.
+- Return ONLY a JSON object.
+
+Output schema:
+{{
+  "subproblem_answers": [
+    {{
+      "subproblem": string,
+      "answer": string,
+      "is_answered": boolean,
+      "evidence_summary": string,
+      "missing_info": string
+    }}
+  ],
+  "rank_summary": string
+}}
+"""
+
+        try:
+            response = get_response_with_retry(prompt)
+            response = response.strip().replace("```json", "").replace("```", "")
+            parsed = fix_json_response(response)
+
+            if not isinstance(parsed, dict):
+                raise ValueError("Unified decomposition response is not a dict.")
+
+            raw_answers = parsed.get("subproblem_answers", [])
+            if not isinstance(raw_answers, list):
+                raw_answers = []
+
+            normalized_by_subproblem: Dict[str, Dict[str, Any]] = {}
+            for raw_answer in raw_answers:
+                if not isinstance(raw_answer, dict):
+                    continue
+
+                subproblem = raw_answer.get("subproblem", "")
+                if not isinstance(subproblem, str):
+                    continue
+
+                key = subproblem.strip().lower()
+                if not key:
+                    continue
+
+                normalized_by_subproblem[key] = {
+                    "subproblem": subproblem.strip(),
+                    "answer": str(raw_answer.get("answer", "") or "").strip(),
+                    "is_answered": bool(raw_answer.get("is_answered", False)),
+                    "evidence_summary": str(raw_answer.get("evidence_summary", "") or "").strip(),
+                    "missing_info": str(raw_answer.get("missing_info", "") or "").strip(),
+                }
+
+            normalized_answers: List[Dict[str, Any]] = []
+            for subproblem in subproblems:
+                key = subproblem.strip().lower()
+                answer = normalized_by_subproblem.get(key)
+                if answer is None:
+                    answer = {
+                        "subproblem": subproblem,
+                        "answer": "",
+                        "is_answered": False,
+                        "evidence_summary": "",
+                        "missing_info": "No answer mapped to this subproblem.",
+                    }
+                else:
+                    answer["subproblem"] = subproblem
+                normalized_answers.append(answer)
+
+            rank_summary = parsed.get("rank_summary", "")
+            if not isinstance(rank_summary, str):
+                rank_summary = ""
+
+            return {
+                "subproblem_answers": normalized_answers,
+                "rank_summary": rank_summary.strip(),
+            }
+
+        except Exception as e:
+            logger.error(f"{Fore.RED}Error decomposing unified context: {e}{Style.RESET_ALL}")
+            return {
+                "subproblem_answers": fallback_answers,
+                "rank_summary": "",
+            }
+
+
+    def refine_summary_with_unified_rank_result(
+        self,
+        question: str,
+        rank: int,
+        subproblems: List[str],
+        unified_query: str,
+        contexts: List[str],
+        decomposed_result: Dict[str, Any],
+        current_summary: str = "",
+    ) -> str:
+        """rank 단위 retrieval 결과와 subproblem별 분해 결과를 기존 info_summary에 병합
+        = 결과를 다시 하나의 누적 summary로 정리
+        - 기존 summary + + 이번 rank의 retrieved context + 이번 rank의 subproblem별 answer -> 새로운 info_summary
+        """
+        try:
+            context_text = "\n\n".join(contexts or [])
+            decomposed_text = json.dumps(decomposed_result, ensure_ascii=False, indent=2)
+
+            # 이미 검색된 context를 읽고 각 subproblem에 해당하는 답을 추출하는 prompt (누적 정보 요약을 업데이트)
+            prompt = f"""
+Please refine the information summary using the latest rank-level unified retrieval result.
+
+Original question:
+{question}
+
+Current summary:
+{current_summary}
+
+Topological rank:
+{rank}
+
+Same-rank subproblems:
+{json.dumps(subproblems, ensure_ascii=False, indent=2)}
+
+Unified query:
+{unified_query}
+
+Retrieved context:
+{context_text}
+
+Decomposed subproblem answers:
+{decomposed_text}
+
+Your refined summary should:
+1. Integrate newly supported facts with the existing summary.
+2. Preserve specific names, dates, numbers, and relations.
+3. Keep separate facts for different subproblems clear.
+4. Avoid unsupported claims.
+5. Remain concise.
+
+Refined summary:
+"""
+            return get_response_with_retry(prompt)
+
+        except Exception as e:
+            logger.error(f"{Fore.RED}Error refining unified rank summary: {e}{Style.RESET_ALL}")
+            fallback = current_summary or ""
+            return (
+                f"{fallback}\n\n"
+                f"Rank {rank} unified query: {unified_query}\n"
+                f"Subproblem answers: {json.dumps(decomposed_result, ensure_ascii=False)}"
+            ).strip()
+
+    def rank_aware_rag(
+        self,
+        question: str,
+        info_summary: str,
+        rank: int,
+        subproblems: List[str],
+        unified_query: str,
+        decomposed_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        - 현재 rank까지 처리한 뒤 원 질문을 답할 수 있는지 판단
+        - dependency_aware_rag()의 idx 기반 판단을 rank 기반으로 바꾼 함수
+        - can_answer == True 이면 바로 최종 답변 생성하고 종료
+        """
+        try:
+            prompt = f"""
+We are performing rank-level retrieval over a Query Logic DAG.
+
+Original question:
+{question}
+
+Available information summary:
+{info_summary}
+
+Current topological rank:
+{rank}
+
+Same-rank subproblems just processed:
+{json.dumps(subproblems, ensure_ascii=False, indent=2)}
+
+Unified query used for this rank:
+{unified_query}
+
+Decomposed result from this rank:
+{json.dumps(decomposed_result, ensure_ascii=False, indent=2)}
+
+Please analyze:
+1. Can the original question now be answered completely? (Yes/No)
+2. Summarize the current understanding.
+3. State what information is still missing, if any.
+
+Return ONLY a JSON object with these keys:
+- "can_answer": boolean
+- "current_understanding": string
+- "missing_info": string
+"""
+            response = get_response_with_retry(prompt)
+            response = response.strip().replace("```json", "").replace("```", "")
+            parsed = fix_json_response(response)
+
+            if not isinstance(parsed, dict):
+                raise ValueError("Rank-aware analysis response is not a dict.")
+
+            return {
+                "can_answer": bool(parsed.get("can_answer", False)),
+                "current_understanding": str(parsed.get("current_understanding", "") or ""),
+                "missing_info": str(parsed.get("missing_info", "") or ""),
+            }
+
+        # [실패] 판단 실패 → 아직 답할 수 없다고 보고 다음 rank 진행
+        except Exception as e:
+            logger.error(f"{Fore.RED}Error in rank_aware_rag: {e}{Style.RESET_ALL}")
+            return {
+                "can_answer": False,
+                "current_understanding": f"Error during rank-level analysis: {str(e)}",
+                "missing_info": "Rank-level analysis failed.",
+            }
+
+
+    @staticmethod
+    def _ranked_subproblem_groups(
+        topological_rank_result: Dict[str, Any],
+        sorted_dependencies: List[str],
+    ) -> List[Dict[str, Any]]:
+        """ Topological rank 결과를 unified retrieval loop에서 돌기 쉬운 형태로 변환하는 역할
+        - topological_rank_result에서 rank별 subproblem group을 추출
+        - [실패] topological_rank_result가 비어 있거나, ranked_dependencies 형식이 이상해서 group을 못 만들면 기존 sorted_dependencies를 fallback으로 사용
+        """
+        ranked_dependencies = topological_rank_result.get("ranked_dependencies", {}) if topological_rank_result else {}
+        groups: List[Dict[str, Any]] = []
+
+        if isinstance(ranked_dependencies, dict) and ranked_dependencies:
+            for raw_rank, raw_subproblems in ranked_dependencies.items():
+                try:
+                    rank = int(raw_rank)
+                except (TypeError, ValueError):
+                    continue
+
+                if not isinstance(raw_subproblems, list):
+                    continue
+
+                subproblems = [
+                    item.strip()
+                    for item in raw_subproblems
+                    if isinstance(item, str) and item.strip()
+                ]
+
+                if subproblems:
+                    groups.append({
+                        "rank": rank,
+                        "subproblems": subproblems,
+                    })
+
+        if not groups:
+            groups = [
+                {
+                    "rank": idx,
+                    "subproblems": [dependency],
+                }
+                for idx, dependency in enumerate(sorted_dependencies or [])
+                if isinstance(dependency, str) and dependency.strip()
+            ]
+
+        return sorted(groups, key=lambda item: item["rank"])
+
+
+    def _retrieve_for_query(
+        self,
+        query: str,
+        retrieved_chunks_set: Optional[set] = None,
+    ) -> List[str]:
+        """ unified query 하나를 실제 retrieval에 넘기는 wrapper 함수
+        - unified query 하나에 대해 retrieval을 수행
+        - filter_repeats=True면 중복 chunk를 제거하고, 아니면 일반 retrieve()를 호출"""
+        if self.filter_repeats and retrieved_chunks_set is not None:
+            contexts = self._retrieve_with_filter(query, retrieved_chunks_set)
+            for chunk in contexts:
+                retrieved_chunks_set.add(chunk)
+            return contexts
+
+        return self.retrieve(query)
 
     def generate_answer(self, question: str, info_summary: str) -> str:
         """Generate final answer based on the information summary."""
@@ -854,61 +1286,101 @@ Output schema:
         logger.info(f"Verified Query Logic DAG: {verified_dag_dict}\n\n")
         logger.info(f"Sorted dependencies: {sorted_dependencies}\n\n")
 
+        # ===============================================
+        # == Stage 5: rank-level unified subquery generation + retrieval ==
+        ranked_subproblem_groups = self._ranked_subproblem_groups(
+            topological_rank_result=topological_rank_result,
+            sorted_dependencies=sorted_dependencies,
+        )
 
-        #===============================================
-        #== Stage 2: agentic iterative retrieval ==
-        idx = 0 # used to track the current dependency index
+        dependency_analysis_history.append({
+            "stage": "unified_subquery_generation",
+            "ranked_subproblem_groups": ranked_subproblem_groups,
+        })
 
-        while round_count < self.max_rounds and idx < len(sorted_dependencies):
+        for rank_group in ranked_subproblem_groups:
+            if round_count >= self.max_rounds:
+                break
+
             round_count += 1
-            
-            current_query = sorted_dependencies[idx]
-            if self.filter_repeats:
-                new_contexts = self._retrieve_with_filter(current_query, retrieved_chunks_set)
-                for chunk in new_contexts:
-                    retrieved_chunks_set.add(chunk)
-            else:
-                new_contexts = self.retrieve(current_query)
-            last_contexts = new_contexts  # Save current contexts
-            
-            
-            # Generate or refine information summary with new contexts
-            info_summary = self.refine_summary_with_context(
-                question, 
-                new_contexts, 
-                info_summary
+
+            rank = rank_group["rank"]
+            same_rank_subproblems = rank_group["subproblems"]
+
+            unified_query = self.build_unified_query(
+                question=question,
+                rank=rank,
+                subproblems=same_rank_subproblems,
             )
-            
-            logger.info(f"Agentic retrieval at round {round_count}")
-            logger.info(f"current query: {current_query}")
-            
-            analysis = self.dependency_aware_rag(question, info_summary, sorted_dependencies, idx)
+
+            new_contexts = self._retrieve_for_query(
+                unified_query,
+                retrieved_chunks_set=retrieved_chunks_set,
+            )
+            last_contexts = new_contexts
+
+            decomposed_result = self.decompose_unified_context_by_subproblem(
+                question=question,
+                rank=rank,
+                subproblems=same_rank_subproblems,
+                unified_query=unified_query,
+                contexts=new_contexts,
+                current_summary=info_summary,
+            )
+
+            info_summary = self.refine_summary_with_unified_rank_result(
+                question=question,
+                rank=rank,
+                subproblems=same_rank_subproblems,
+                unified_query=unified_query,
+                contexts=new_contexts,
+                decomposed_result=decomposed_result,
+                current_summary=info_summary,
+            )
+
+            logger.info(f"Unified retrieval at round {round_count}, topological rank {rank}")
+            logger.info(f"same-rank subproblems: {same_rank_subproblems}")
+            logger.info(f"unified query: {unified_query}")
+
+            analysis = self.rank_aware_rag(
+                question=question,
+                info_summary=info_summary,
+                rank=rank,
+                subproblems=same_rank_subproblems,
+                unified_query=unified_query,
+                decomposed_result=decomposed_result,
+            )
 
             retrieval_history.append({
                 "round": round_count,
-                "query": current_query,
+                "rank": rank,
+                "subproblems": same_rank_subproblems,
+                "unified_query": unified_query,
                 "contexts": new_contexts,
-            }) 
+                "decomposed_result": decomposed_result,
+            })
 
             dependency_analysis_history.append({
                 "round": round_count,
-                "query": current_query,
-                "analysis": analysis
+                "rank": rank,
+                "subproblems": same_rank_subproblems,
+                "unified_query": unified_query,
+                "decomposed_result": decomposed_result,
+                "analysis": analysis,
             })
 
-            if analysis["can_answer"]:
-                # Generate and return final answer
+            if analysis.get("can_answer", False):
                 answer = self.generate_answer(question, info_summary)
-                # Store dependency analysis history for evaluation access
                 self.last_dependency_analysis = dependency_analysis_history
-                # We return the last retrieved contexts for evaluation purposes
+                self.last_retrieval_history = retrieval_history
                 return answer, last_contexts, round_count
-            else:
-                idx += 1
-        
-        # If max rounds reached, generate best possible answer
-        logger.info(f"Reached maximum rounds ({self.max_rounds}). Generating final answer...")
+
+        # If max rounds reached or all rank groups processed, generate best possible answer.
+        logger.info(
+            f"Reached rank-level retrieval stopping condition "
+            f"({round_count}/{self.max_rounds}). Generating final answer..."
+        )
         answer = self.generate_answer(question, info_summary)
-        # Store dependency analysis history for evaluation access
         self.last_dependency_analysis = dependency_analysis_history
+        self.last_retrieval_history = retrieval_history
         return answer, last_contexts, round_count
