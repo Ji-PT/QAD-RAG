@@ -22,36 +22,35 @@ class LogicRAG(BaseRAG):
     def __init__(self, corpus_path: str = None, cache_dir: str = "./cache", filter_repeats: bool = False):
         """Initialize the LogicRAG system."""
         super().__init__(corpus_path, cache_dir)
-
         self.max_rounds = 3  # Default max rounds for iterative retrieval
         self.MODEL_NAME = "LogicRAG"
         self.filter_repeats = filter_repeats  # Option to filter repeated chunks across rounds
 
-        # Builder for constructing an explicit Query Logic DAG G=(V,E)
-        # from decomposed dependencies.
+        # Query decomposition 담당자가 만든 decompose_query()의 결과인 subproblems를
+        # Query Logic DAG G=(V,E)로 변환하기 위한 Builder.
+        #
+        # 주의:
+        # - decompose_query() 함수 자체는 이 파일에 추가하지 않는다.
+        # - 해당 함수는 dev 브랜치의 쿼리 분해 코드와 merge될 때 들어온다고 가정한다.
+        # - 여기서는 decomposition["subproblems"]를 DAG Builder에 연결하는 역할만 한다.
         self.dag_builder = QueryLogicDAGBuilder()
 
-        # Store the most recently constructed Query Logic DAG for debugging,
-        # evaluation, and downstream graph-based reasoning modules.
+        # 마지막으로 생성된 Query Logic DAG를 평가/디버깅용으로 저장한다.
         self.last_query_logic_dag = None
     
     def set_max_rounds(self, max_rounds: int):
         """Set the maximum number of retrieval rounds."""
         self.max_rounds = max_rounds
     
-    def refine_summary_with_context(
-        self,
-        question: str,
-        new_contexts: List[str],
-        current_summary: str = ""
-    ) -> str:
+    def refine_summary_with_context(self, question: str, new_contexts: List[str], 
+                                  current_summary: str = "") -> str:
         """
         Generate a new summary or refine an existing one based on newly retrieved contexts.
         
         Args:
             question: The original question
             new_contexts: Newly retrieved context chunks
-            current_summary: Current information summary, if any
+            current_summary: Current information summary (if any)
             
         Returns:
             A concise summary of all relevant information so far
@@ -101,7 +100,6 @@ Refined summary:"""
             
         except Exception as e:
             logger.error(f"{Fore.RED}Error generating/refining summary: {e}{Style.RESET_ALL}")
-
             # If error occurs, concatenate current summary with new contexts as fallback
             if current_summary:
                 return f"{current_summary}\n\nNew information:\n{context_text}"
@@ -109,16 +107,14 @@ Refined summary:"""
     
     def warm_up_analysis(self, question: str, info_summary: str) -> Dict:
         """
-        Analyze whether the question can be answered with simple fact retrieval,
-        before performing deeper dependency-aware reasoning.
+        This is a warm-up analysis, which is used to analyze if the question can be answered with simple fact retrieval, without any dependency analysis.
         
         Args:
             question: The original question
             info_summary: Current information summary
             
         Returns:
-            Dictionary with answerability analysis, missing information,
-            current understanding, and logical dependencies
+            Dictionary with analysis results
         """
         try:
             prompt = f"""Question: {question}
@@ -143,10 +139,10 @@ Please format your response as a JSON object with these keys:
 - "missing_reason": string (brief explanation why info is missing, max 20 words)"""
             
             response = get_response_with_retry(prompt)
-
-            # Clean up response to ensure it is valid JSON
+            
+            # Clean up response to ensure it's valid JSON
             response = response.strip()
-
+            
             # Remove any markdown code block markers
             response = response.replace('```json', '').replace('```', '')
             
@@ -168,7 +164,7 @@ Please format your response as a JSON object with these keys:
                 logger.error(f"{Fore.RED}Missing required fields in response: {response}{Style.RESET_ALL}")
                 raise ValueError("Missing required fields")
             
-            # Add default values for interpretability fields if missing
+            # Add default values for new interpretability fields if missing
             if "dependencies" not in result:
                 result["dependencies"] = ["Information relevant to the question"]
             if "missing_reason" not in result:
@@ -194,26 +190,20 @@ Please format your response as a JSON object with these keys:
                 "missing_reason": "Analysis error occurred"
             }
 
-    def dependency_aware_rag(
-        self,
-        question: str,
-        info_summary: str,
-        dependencies: List[str],
-        idx: int
-    ) -> Dict:
+    def dependency_aware_rag(self, question: str, info_summary: str, dependencies: List[str], idx: int) -> str:
         """
-        Analyze whether the current information summary is sufficient to answer
-        the original question, using the sorted dependencies as reasoning references.
+        similar to "self.analyze_dependency_graph" that analyzes whether the current information summary is sufficient to answer the question,
+        this function analyzes whether the current information summary is sufficient to answer the question with the decomposed dependencies as references.
+
+        And the function will answer whether the question can be answered, and if not, it will update the current query with dependencies as references.
 
         Args:
-            question: The original question
-            info_summary: Current accumulated information summary
-            dependencies: Topologically sorted dependencies
-            idx: Current dependency index
-
-        Returns:
-            Dictionary with can_answer and current_understanding
+            question: str
+            info_summary: str
+            dependencies: List[str]
+            idx: int
         """
+
         try:
             prompt = f"""
             We pre-parsed the question into a list of dependencies, and the dependencies are sorted in a topological order, below is the question, the information summary, and the decomposed dependencies:
@@ -241,7 +231,6 @@ Please format your response as a JSON object with these keys:
             response = get_response_with_retry(prompt)
             result = fix_json_response(response)
             return result
-
         except Exception as e:
             logger.error(f"{Fore.RED}Error in dependency_aware_rag: {e}{Style.RESET_ALL}")
             return {
@@ -268,22 +257,23 @@ Remember: Be concise - give ONLY the essential answer, nothing more.
 Ans: """
             
             return get_response_with_retry(prompt)
-
         except Exception as e:
             logger.error(f"{Fore.RED}Error generating answer: {e}{Style.RESET_ALL}")
             return ""
 
-    def _sort_dependencies(self, dependencies: List[str], query) -> List[str]:
+    def _sort_dependencies(self, dependencies: List[str], query) -> List[Tuple]:
         """
         Legacy dependency sorting method.
 
         Given a list of dependencies and the original query, this method asks the LLM
         to infer dependency pairs, then applies graph-based topological sorting.
 
-        This method is currently kept for backward compatibility and ablation testing.
-        The main dependency flow now constructs an explicit Query Logic DAG before sorting.
+        This method is kept for backward compatibility and ablation testing.
+        The main path after merge should construct an explicit Query Logic DAG
+        from decomposition["subproblems"] before sorting.
         """
-        # Step 1: generate dependency pairs by prompting the LLM
+
+        # Step 1: generate the dependency pairs by prompting LLMs
         prompt = f"""
         Given the question:
         Question: {query}
@@ -300,27 +290,31 @@ Ans: """
         result = fix_json_response(response)
         dependency_pairs = result["dependency_pairs"]
 
-        # Step 2: use graph-based algorithm to sort the dependencies in topological order
+        # Step 2: use graph-based algorithm to sort the dependencies in a topological order
         sorted_dependencies = self._topological_sort(dependencies, dependency_pairs)
         return sorted_dependencies
 
     @staticmethod
     def _topological_sort(dependencies: List[str], dependencies_pairs: List[Tuple[int, int]]) -> List[str]:
         """
-        Use graph-based algorithm to sort dependencies in topological order.
+        Use graph-based algorithm to sort the dependencies in a topological order.
 
         Args:
-            dependencies: List of dependency texts
-            dependencies_pairs: Legacy dependency pairs in the format
-                (dependent_idx, dependency_idx)
+            dependencies: List[str]
+            dependencies_pairs: List[Tuple[int, int]]
 
         Returns:
-            List of dependency texts sorted in topological order
+            List[str]
 
         Note:
-            This is a legacy compatibility sorter. The new Query Logic DAG uses
-            edges in the direction prerequisite_id -> dependent_id, so DAG edges
-            must be converted to legacy pairs before calling this method.
+            QueryLogicDAG uses edges in the direction:
+                prerequisite_id -> dependent_id
+
+            This legacy sorter expects pairs in the format:
+                (dependent_idx, dependency_idx)
+
+            Therefore, QueryLogicDAG.to_legacy_dependency_pairs() is used before
+            calling this method.
         """
         graph = {dep: [] for dep in dependencies}
         
@@ -336,12 +330,9 @@ Ans: """
         def dfs(node):
             if node in visited:
                 return
-
             visited.add(node)
-
             for neighbor in graph[node]:
                 dfs(neighbor)
-
             stack.append(node)
 
         for node in graph:
@@ -352,24 +343,21 @@ Ans: """
 
     def _retrieve_with_filter(self, query: str, retrieved_chunks_set: set) -> list:
         """
-        Retrieve top_k unique chunks not in retrieved_chunks_set.
-        If not enough unique chunks are found, expand the retrieval window.
+        Retrieve top_k unique chunks not in retrieved_chunks_set. If not enough unique chunks, return as many as possible.
         """
         all_results = self.retrieve(query)
         unique_results = []
         idx = self.top_k
-
-        # If not enough unique chunks are found in top_k, keep expanding
+        # If not enough unique in top_k, keep expanding
         while len(unique_results) < self.top_k and idx <= len(self.corpus):
             # Expand retrieval window
             all_results = self.retrieve(query) if idx == self.top_k else self._retrieve_top_n(query, idx)
             unique_results = [chunk for chunk in all_results if chunk not in retrieved_chunks_set]
             idx += self.top_k
-
         return unique_results[:self.top_k]
 
     def _retrieve_top_n(self, query: str, n: int) -> list:
-        """Retrieve top-n results for a query. Helper for filtering repeated chunks."""
+        """Retrieve top-n results for a query (helper for filtering)."""
         # Temporarily override top_k
         old_top_k = self.top_k
         self.top_k = n
@@ -378,24 +366,7 @@ Ans: """
         return results
 
     def answer_question(self, question: str) -> Tuple[str, List[str], int]:
-        """
-        Answer a question using LogicRAG.
 
-        The process consists of:
-        1. Warm-up retrieval and summarization
-        2. Answerability analysis
-        3. Query Logic DAG construction if deeper reasoning is required
-        4. Dependency-aware iterative retrieval
-        5. Final answer generation
-
-        Args:
-            question: The input question
-
-        Returns:
-            answer: Generated final answer
-            last_contexts: Last retrieved contexts for evaluation
-            round_count: Number of iterative retrieval rounds used
-        """
         info_summary = "" 
         round_count = 0
         current_query = question
@@ -414,44 +385,46 @@ Ans: """
                 retrieved_chunks_set.add(chunk)
         else:
             new_contexts = self.retrieve(question)
-
-        last_contexts = new_contexts  # Save current contexts for evaluation
-        
-        # Generate or refine information summary with warm-up contexts
+        last_contexts = new_contexts  
         info_summary = self.refine_summary_with_context(
             question, 
             new_contexts, 
             info_summary
         )
 
-        analysis = self.warm_up_analysis(question, info_summary)
+        # Query decomposition 담당자가 dev 브랜치에 추가한 decompose_query()를 사용한다.
+        #
+        # 주의:
+        # - decompose_query() 함수 정의는 이 파일에 직접 추가하지 않는다.
+        # - dev와 merge되면 self.decompose_query(question)가 존재한다고 가정한다.
+        # - 반환값 decomposition["subproblems"]는 [{"id": int, "text": str}, ...] 형식이어야 한다.
+        decomposition = self.decompose_query(question)
 
-        if analysis["can_answer"]:
-            # In this case, the question can be answered with simple fact retrieval,
-            # without dependency-aware reasoning.
-            print("Warm-up analysis indicate the question can be answered with simple fact retrieval, without any dependency analysis.")
+        if decomposition["is_simple"]:
+            # In this case, the question can be answered with simple fact retrieval, without any dependency analysis
+            print("Query decomposition indicates a simple single-hop question. Answering directly.")
             answer = self.generate_answer(question, info_summary)
-
             # Reset dependency analysis history for simple questions
             self.last_dependency_analysis = []
+            self.last_query_logic_dag = None
             return answer, last_contexts, round_count
-
         else:
-            logger.info("Warm-up analysis indicate the requirement of deeper reasoning-enhanced RAG. Now perform analysis with logical dependency graph.")
-            logger.info(f"Dependencies: {', '.join(analysis.get('dependencies', []))}")
+            logger.info(f"Query decomposition result: {len(decomposition['subproblems'])} subproblems detected.")
+            logger.info(f"Subproblems: {decomposition['subproblems']}")
 
-            # Construct an explicit Query Logic DAG G=(V,E) from the dependencies.
-            # Each dependency becomes a node, and LLM-inferred logical prerequisites
-            # become directed edges.
+            # Query decomposition 결과 P를 Query Logic DAG G=(V,E)로 변환한다.
             #
-            # Edge direction:
-            #   prerequisite_id -> dependent_id
-            dag = self.dag_builder.construct_from_dependency_texts(
+            # 논문 대응:
+            #   - 입력 query Q를 subproblem 집합 P로 분해한다.
+            #   - 각 subproblem p_i는 DAG의 node v_i가 된다.
+            #   - subproblem 사이의 logical dependency는 DAG의 edge E가 된다.
+            #   - edge는 QueryLogicDAGBuilder 내부에서 logical precedence 기준으로 추론한다.
+            dag = self.dag_builder.construct_from_subproblems(
                 question=question,
-                dependencies=analysis["dependencies"],
+                subproblems=decomposition["subproblems"],
             )
 
-            # Keep the DAG for later inspection, debugging, and evaluation.
+            # 생성된 DAG를 평가/디버깅용으로 저장한다.
             self.last_query_logic_dag = dag
 
             dependency_analysis_history.append({
@@ -459,17 +432,15 @@ Ans: """
             })
             logger.info(f"Constructed Query Logic DAG: {dag.to_dict()}\n\n")
 
-            # Temporary compatibility path for the existing retrieval loop.
+            # 기존 retrieval loop와 연결하기 위한 임시 호환 경로.
             #
-            # The new DAG stores edges as:
+            # QueryLogicDAG edge 방향:
             #   prerequisite_id -> dependent_id
             #
-            # The legacy _topological_sort() expects pairs as:
+            # 기존 _topological_sort() 입력 형식:
             #   (dependent_idx, dependency_idx)
             #
-            # Therefore, we convert the DAG back into legacy dependency pairs.
-            # This block should later be replaced by a cycle-safe DAG topological
-            # sorter once the graph validation/sorting module is integrated.
+            # 따라서 DAG edge를 기존 pair 형식으로 변환한 뒤 topological sort를 수행한다.
             sorted_dependencies = self._topological_sort(
                 dag.node_texts_in_id_order(),
                 dag.to_legacy_dependency_pairs(),
@@ -480,21 +451,20 @@ Ans: """
 
         #===============================================
         #== Stage 2: agentic iterative retrieval ==
-        idx = 0  # Track the current dependency index
+        idx = 0 # used to track the current dependency index
 
         while round_count < self.max_rounds and idx < len(sorted_dependencies):
             round_count += 1
             
             current_query = sorted_dependencies[idx]
-
             if self.filter_repeats:
                 new_contexts = self._retrieve_with_filter(current_query, retrieved_chunks_set)
                 for chunk in new_contexts:
                     retrieved_chunks_set.add(chunk)
             else:
                 new_contexts = self.retrieve(current_query)
-
-            last_contexts = new_contexts  # Save current contexts for evaluation
+            last_contexts = new_contexts  # Save current contexts
+            
             
             # Generate or refine information summary with new contexts
             info_summary = self.refine_summary_with_context(
@@ -506,12 +476,7 @@ Ans: """
             logger.info(f"Agentic retrieval at round {round_count}")
             logger.info(f"current query: {current_query}")
             
-            analysis = self.dependency_aware_rag(
-                question,
-                info_summary,
-                sorted_dependencies,
-                idx
-            )
+            analysis = self.dependency_aware_rag(question, info_summary, sorted_dependencies, idx)
 
             retrieval_history.append({
                 "round": round_count,
@@ -528,20 +493,16 @@ Ans: """
             if analysis["can_answer"]:
                 # Generate and return final answer
                 answer = self.generate_answer(question, info_summary)
-
                 # Store dependency analysis history for evaluation access
                 self.last_dependency_analysis = dependency_analysis_history
-
-                # Return the last retrieved contexts for evaluation purposes
+                # We return the last retrieved contexts for evaluation purposes
                 return answer, last_contexts, round_count
-
             else:
                 idx += 1
         
         # If max rounds reached, generate best possible answer
         logger.info(f"Reached maximum rounds ({self.max_rounds}). Generating final answer...")
         answer = self.generate_answer(question, info_summary)
-
         # Store dependency analysis history for evaluation access
         self.last_dependency_analysis = dependency_analysis_history
         return answer, last_contexts, round_count
