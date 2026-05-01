@@ -16,6 +16,45 @@ logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger(__name__)
 
+# [추가] Few-shot 예시 상수 (논문 Section 3.2)
+# decompose_query()의 프롬프트에서 참조
+# subproblems 형식: {"id", "text"} → QueryLogicDAGBuilder 입력 형식에 맞춤
+QUERY_DECOMPOSITION_FEW_SHOT_EXAMPLES = """
+Example 1:
+Question: "Who is the mayor of the capital of France?"
+Subproblems:
+[
+  {"id": 0, "text": "What is the capital of France?"},
+  {"id": 1, "text": "Who is the mayor of this capital city?"}
+]
+
+Example 2:
+Question: "When was the director of 'Inception' born, and what award did the film win at the Oscars?"
+Subproblems:
+[
+  {"id": 0, "text": "Who directed the film 'Inception'?"},
+  {"id": 1, "text": "When was this director born?"},
+  {"id": 2, "text": "What award did 'Inception' win at the Oscars?"}
+]
+
+Example 3:
+Question: "What is the population of the country where the inventor of the telephone was born?"
+Subproblems:
+[
+  {"id": 0, "text": "Who invented the telephone?"},
+  {"id": 1, "text": "In which country was this inventor born?"},
+  {"id": 2, "text": "What is the population of this country?"}
+]
+
+Example 4:
+Question: "What is the tallest building in Tokyo?"
+Subproblems:
+[
+  {"id": 0, "text": "What is the tallest building in Tokyo?"}
+]
+"""
+
+
 
 class LogicRAG(BaseRAG):
     
@@ -29,10 +68,8 @@ class LogicRAG(BaseRAG):
         # Query decomposition 담당자가 만든 decompose_query()의 결과인 subproblems를
         # Query Logic DAG G=(V,E)로 변환하기 위한 Builder.
         #
-        # 주의:
-        # - decompose_query() 함수 자체는 이 파일에 추가하지 않는다.
-        # - 해당 함수는 dev 브랜치의 쿼리 분해 코드와 merge될 때 들어온다고 가정한다.
-        # - 여기서는 decomposition["subproblems"]를 DAG Builder에 연결하는 역할만 한다.
+        # 여기서는 decomposition["subproblems"]를 DAG Builder에 연결하는 역할만 한다.
+        
         self.dag_builder = QueryLogicDAGBuilder()
 
         # 마지막으로 생성된 Query Logic DAG를 평가/디버깅용으로 저장한다.
@@ -189,6 +226,64 @@ Please format your response as a JSON object with these keys:
                 "dependencies": ["Information relevant to the question"],
                 "missing_reason": "Analysis error occurred"
             }
+
+    # [추가] 논문 Section 3.2 - Query Decomposition Prompting
+    # subproblem 분해 + Few-shot prompting을 하나의 Task로 합침
+    # 출력된 subproblems는 QueryLogicDAGBuilder.construct_from_subproblems()의 input으로 전달됨
+    def decompose_query(self, question: str) -> Dict:
+        """
+        Decompose the input query into subproblems using few-shot prompting.
+        Output subproblems are passed to QueryLogicDAGBuilder.construct_from_subproblems().
+
+        Args:
+            question: The original question
+
+        Returns:
+            Dictionary with:
+                - "subproblems": List[Dict]  # [{"id": int, "text": str}, ...]
+                - "is_simple": bool
+        """
+        try:
+            prompt = f"""You are an expert at decomposing complex questions into smaller, logically ordered subproblems.
+
+Given a question, you must:
+1. Decompose the question into a minimal set of subproblems. Each subproblem must have an "id" (integer, starting from 0) and a "text" (the subproblem question string).
+2. If the question is simple (single-hop, no decomposition needed), output a single subproblem identical to the original question.
+
+Here are some examples:
+{QUERY_DECOMPOSITION_FEW_SHOT_EXAMPLES}
+
+Now decompose the following question:
+Question: "{question}"
+
+Please format your response as a JSON object with these keys:
+- "subproblems": list of objects, each with "id" (int) and "text" (string)
+- "is_simple": boolean
+
+Respond ONLY with the JSON object, no additional text."""
+
+            response = get_response_with_retry(prompt)
+
+            # Remove any markdown code block markers
+            response = response.strip().replace('```json', '').replace('```', '')
+
+            # Parse the cleaned response using fix_json_response
+            result = fix_json_response(response)
+
+            if result is None:
+                return {"subproblems": [{"id": 0, "text": question}], "is_simple": True}
+
+            # Validate required fields
+            if "subproblems" not in result or not isinstance(result["subproblems"], list) or len(result["subproblems"]) == 0:
+                result["subproblems"] = [{"id": 0, "text": question}]
+            if "is_simple" not in result:
+                result["is_simple"] = len(result["subproblems"]) <= 1
+
+            return result
+
+        except Exception as e:
+            logger.error(f"{Fore.RED}Error in decompose_query: {e}{Style.RESET_ALL}")
+            return {"subproblems": [{"id": 0, "text": question}], "is_simple": True}
 
     def dependency_aware_rag(self, question: str, info_summary: str, dependencies: List[str], idx: int) -> str:
         """
@@ -392,14 +487,11 @@ Ans: """
             info_summary
         )
 
-        # Query decomposition 담당자가 dev 브랜치에 추가한 decompose_query()를 사용한다.
-        #
-        # 주의:
-        # - decompose_query() 함수 정의는 이 파일에 직접 추가하지 않는다.
-        # - dev와 merge되면 self.decompose_query(question)가 존재한다고 가정한다.
-        # - 반환값 decomposition["subproblems"]는 [{"id": int, "text": str}, ...] 형식이어야 한다.
+        # [수정] warm_up_analysis() 대신 decompose_query()를 사용 (논문 Section 3.2)
+        # subproblems는 이후 QueryLogicDAGBuilder.construct_from_subproblems()의 input으로 전달됨
         decomposition = self.decompose_query(question)
-
+        # Query decomposition 담당자가 dev 브랜치에 추가한 decompose_query()를 사용한다.
+       
         if decomposition["is_simple"]:
             # In this case, the question can be answered with simple fact retrieval, without any dependency analysis
             print("Query decomposition indicates a simple single-hop question. Answering directly.")
@@ -412,7 +504,7 @@ Ans: """
             logger.info(f"Query decomposition result: {len(decomposition['subproblems'])} subproblems detected.")
             logger.info(f"Subproblems: {decomposition['subproblems']}")
 
-            # Query decomposition 결과 P를 Query Logic DAG G=(V,E)로 변환한다.
+            # Query decompif decomposition["is_simple"]:Query decomposition  결과 P를 Query Logic DAG G=(V,E)로 변환한다.
             #
             # 논문 대응:
             #   - 입력 query Q를 subproblem 집합 P로 분해한다.
