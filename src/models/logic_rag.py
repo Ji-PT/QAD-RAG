@@ -3,6 +3,16 @@ import json
 import logging
 from typing import List, Dict, Tuple, Any
 from src.models.base_rag import BaseRAG
+from src.models.verify_non_cyclicity import (
+    verify_dag_and_topological_sort,
+    DependencyGraphCycleError,
+    build_partial_order_fallback,
+)
+from src.models.dag_topological_rank import (
+    compute_topological_ranks_from_verification,
+    attach_topological_ranks_to_dag_dict,
+    TopologicalRankError,
+)
 from src.utils.utils import get_response_with_retry, fix_json_response
 from colorama import Fore, Style, init
 
@@ -790,7 +800,7 @@ Output schema:
         logger.info(f"Constructed Query Logic DAG: {dag_dict}\n\n")
 
         # ===============================================
-        # == Stage 3: DAG tological sort + cycle verification ==
+        # == Stage 3: DAG topological sort + cycle verification ==
 
         sorted_dependencies, verified_dag_dict, dag_verification_history = (
             self._verify_sort_dependencies_with_repair(
@@ -803,10 +813,41 @@ Output schema:
 
         self.last_query_logic_dag_dict = verified_dag_dict
 
+        # ===============================================
+        # == Stage 4: Topological rank calculation ==
+        final_dag_result = dag_verification_history[-1]["dag_verification"]
+
+        if final_dag_result.get("is_dag", False):
+            try:
+                topological_rank_result = compute_topological_ranks_from_verification(
+                    final_dag_result
+                )
+
+                verified_dag_dict = attach_topological_ranks_to_dag_dict(
+                    verified_dag_dict,
+                    topological_rank_result,
+                )
+
+                logger.info(f"Topological rank result: {topological_rank_result}\n\n")
+
+            except TopologicalRankError as e:
+                logger.error(
+                    f"{Fore.RED}Failed to compute topological ranks: {e}{Style.RESET_ALL}"
+                )
+                topological_rank_result = {}
+        else:
+            topological_rank_result = {}
+            logger.warning(
+                f"{Fore.YELLOW}Skip topological rank calculation because final DAG is not valid.{Style.RESET_ALL}"
+            )
+
+        self.last_query_logic_dag_dict = verified_dag_dict
+
         dependency_analysis_history.append({
             "query_logic_dag": dag_dict,
             "verified_query_logic_dag": verified_dag_dict,
             "dag_verification_history": dag_verification_history,
+            "topological_rank": topological_rank_result,
             "sorted_dependencies": sorted_dependencies,
         })
 
