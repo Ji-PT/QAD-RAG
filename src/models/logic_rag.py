@@ -4,6 +4,7 @@ import logging
 from typing import List, Dict, Tuple, Any, Optional
 
 from src.models.base_rag import BaseRAG
+from src.models.query_logic_dag import QueryLogicDAGBuilder
 from src.models.verify_non_cyclicity import (
     verify_dag_and_topological_sort,
     DependencyGraphCycleError,
@@ -73,7 +74,7 @@ class LogicRAG(BaseRAG):
         """Initialize the LogicRAG system."""
         super().__init__(corpus_path, cache_dir)
 
-        self.max_rounds = 3  # agentic iterative retrieval의 최대 round 수
+        self.max_rounds = 3  # rank-level retrieval round의 최대 횟수
         self.MODEL_NAME = "LogicRAG"
         self.filter_repeats = filter_repeats  # Option to filter repeated chunks across rounds
 
@@ -1142,33 +1143,58 @@ Output schema:
 
     def _retrieve_with_filter(self, query: str, retrieved_chunks_set: set) -> list:
         """
-        Retrieve top_k unique chunks not in retrieved_chunks_set. If not enough unique chunks, return as many as possible.
+        context chunk에 대한 Sampling without Replacement (Sampling w/o replacement)
+
+        1. query에 대해 먼저 top-k chunk를 검색
+        2. 이전 retrieval round에서 이미 사용한 chunk를 제거
+        3. 남은 unique chunk 수가 top_k보다 적으면, top-2k, top-3k, ... 방식으로 retrieval 범위를 확장
+        4. 충분한 unseen chunk를 찾거나 전체 corpus를 확인할 때까지 반복
+
+        반복 retrieval round에서 동일한 evidence chunk가 계속 사용되는 것을 방지하기 위한 목적
         """
-        all_results = self.retrieve(query)
+        if retrieved_chunks_set is None:
+            retrieved_chunks_set = set()
+
+        if self.corpus_embeddings is None or not self.corpus:
+            return []
+
+        target_k = min(int(self.top_k), len(self.corpus))
+        if target_k <= 0:
+            return []
+
         unique_results = []
-        idx = self.top_k
-        # If not enough unique in top_k, keep expanding
-        while len(unique_results) < self.top_k and idx <= len(self.corpus):
-            # Expand retrieval window
-            all_results = self.retrieve(query) if idx == self.top_k else self._retrieve_top_n(query, idx)
-            unique_results = [chunk for chunk in all_results if chunk not in retrieved_chunks_set]
-            idx += self.top_k
-        return unique_results[:self.top_k]
+        retrieval_window = target_k
+
+        while len(unique_results) < target_k and retrieval_window <= len(self.corpus):
+            all_results = self._retrieve_top_n(query, retrieval_window)
+            unique_results = [
+                chunk
+                for chunk in all_results
+                if chunk not in retrieved_chunks_set
+            ]
+
+            if len(unique_results) >= target_k:
+                break
+
+            retrieval_window += target_k
+
+        return unique_results[:target_k]
 
     def _retrieve_top_n(self, query: str, n: int) -> list:
-        """Retrieve top-n results for a query (helper for filtering)."""
+        """query에 대해 top-n 결과 검색"""
         # Temporarily override top_k
         old_top_k = self.top_k
-        self.top_k = n
-        results = self.retrieve(query)
-        self.top_k = old_top_k
-        return results
+        try:
+            self.top_k = min(int(n), len(self.corpus))
+            return self.retrieve(query)
+        finally:
+            self.top_k = old_top_k
 
     def answer_question(self, question: str) -> Tuple[str, List[str], int]:
 
         info_summary = "" 
         round_count = 0
-        current_query = question
+        # current_query = question
         retrieval_history = []
         last_contexts = []  
         dependency_analysis_history = []  
@@ -1298,10 +1324,13 @@ Output schema:
             "ranked_subproblem_groups": ranked_subproblem_groups,
         })
 
-        for rank_group in ranked_subproblem_groups:
-            if round_count >= self.max_rounds:
-                break
+        # rank-batch 단위의 Sampling without Replacement
+        # 한 번 pop된 rank group은 모델이 아직 불확실하더라도 다시 방문하지 않는다.
+        # logical batch를 반복 처리하는 hesitation 현상을 방지한다.
+        remaining_rank_groups = list(ranked_subproblem_groups)
 
+        while remaining_rank_groups and round_count < self.max_rounds:
+            rank_group = remaining_rank_groups.pop(0)
             round_count += 1
 
             rank = rank_group["rank"]
