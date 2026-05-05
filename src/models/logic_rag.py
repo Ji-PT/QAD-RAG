@@ -15,6 +15,7 @@ from src.models.dag_topological_rank import (
     attach_topological_ranks_to_dag_dict,
     TopologicalRankError,
 )
+from src.models.dag_rank_resolver import ParentConditionedRankResolver
 from src.utils.utils import get_response_with_retry, fix_json_response
 from colorama import Fore, Style, init
 
@@ -1313,102 +1314,63 @@ Output schema:
         logger.info(f"Sorted dependencies: {sorted_dependencies}\n\n")
 
         # ===============================================
-        # == Stage 5: rank-level unified subquery generation + retrieval ==
-        ranked_subproblem_groups = self._ranked_subproblem_groups(
+        # == Stage 5: Parent-answer conditioned rank-level greedy retrieval ==
+        #
+        # 논문 대응:
+        # - 같은 topological rank의 subproblem들을 unified query로 묶는다.
+        # - 각 node의 parent answer를 unified query 생성에 같이 넣는다.
+        # - rank를 오름차순으로 처리한다.
+        # - node별 중간 답은 node_id 기준으로 저장한다.
+        #
+        # max_rounds 설정:
+        # - rank_processing_limit = None
+        #   → 모든 rank를 끝까지 처리한다.
+        #   → 논문 Algorithm 1 흐름에 더 가깝다.
+        #
+        # - rank_processing_limit = self.max_rounds
+        #   → 기존 dev 코드처럼 최대 self.max_rounds개 rank만 처리한다.
+        #   → 현재 __init__에서 self.max_rounds = 3 이므로 기본 최대 3개 rank 처리.
+        #
+        # 주의:
+        # - self.max_rounds로 바꾸면 "최대 3개 rank 처리"는 복원된다.
+        # - 하지만 기존 Stage 5의 rank_aware_rag() 기반 early stop까지 복원되는 것은 아니다.
+        #   즉, 이 새 resolver 방식에서는 선택한 rank 개수만큼 처리한 뒤 final answer를 만든다.
+
+        rank_processing_limit = None
+        # 기존처럼 최대 3개 rank만 처리하고 싶으면 위 줄 대신 아래 줄을 사용한다.
+        # rank_processing_limit = self.max_rounds
+
+        rank_resolver = ParentConditionedRankResolver(self)
+
+        stage5_result = rank_resolver.run(
+            question=question,
+            dag_result=final_dag_result,
             topological_rank_result=topological_rank_result,
             sorted_dependencies=sorted_dependencies,
+            initial_memory=info_summary,
+            retrieved_chunks_set=retrieved_chunks_set,
+            max_rounds=rank_processing_limit,
         )
+
+        info_summary = stage5_result["final_memory"]
+        last_contexts = stage5_result["last_contexts"]
+        round_count = stage5_result["round_count"]
+        retrieval_history = stage5_result["retrieval_history"]
 
         dependency_analysis_history.append({
-            "stage": "unified_subquery_generation",
-            "ranked_subproblem_groups": ranked_subproblem_groups,
+            "stage": "parent_answer_conditioned_rank_resolution",
+            "rank_groups": stage5_result["rank_groups"],
+            "processed_rank_groups": stage5_result["processed_rank_groups"],
+            "resolved_answers_by_node_id": stage5_result["resolved_answers_by_node_id"],
+            "final_subanswer_summary": stage5_result["final_subanswer_summary"],
+            "retrieval_history": retrieval_history,
         })
 
-        # rank-batch 단위의 Sampling without Replacement
-        # 한 번 pop된 rank group은 모델이 아직 불확실하더라도 다시 방문하지 않는다.
-        # logical batch를 반복 처리하는 hesitation 현상을 방지한다.
-        remaining_rank_groups = list(ranked_subproblem_groups)
-
-        while remaining_rank_groups and round_count < self.max_rounds:
-            rank_group = remaining_rank_groups.pop(0)
-            round_count += 1
-
-            rank = rank_group["rank"]
-            same_rank_subproblems = rank_group["subproblems"]
-
-            unified_query = self.build_unified_query(
-                question=question,
-                rank=rank,
-                subproblems=same_rank_subproblems,
-            )
-
-            new_contexts = self._retrieve_for_query(
-                unified_query,
-                retrieved_chunks_set=retrieved_chunks_set,
-            )
-            last_contexts = new_contexts
-
-            decomposed_result = self.decompose_unified_context_by_subproblem(
-                question=question,
-                rank=rank,
-                subproblems=same_rank_subproblems,
-                unified_query=unified_query,
-                contexts=new_contexts,
-                current_summary=info_summary,
-            )
-
-            info_summary = self.refine_summary_with_unified_rank_result(
-                question=question,
-                rank=rank,
-                subproblems=same_rank_subproblems,
-                unified_query=unified_query,
-                contexts=new_contexts,
-                decomposed_result=decomposed_result,
-                current_summary=info_summary,
-            )
-
-            logger.info(f"Unified retrieval at round {round_count}, topological rank {rank}")
-            logger.info(f"same-rank subproblems: {same_rank_subproblems}")
-            logger.info(f"unified query: {unified_query}")
-
-            analysis = self.rank_aware_rag(
-                question=question,
-                info_summary=info_summary,
-                rank=rank,
-                subproblems=same_rank_subproblems,
-                unified_query=unified_query,
-                decomposed_result=decomposed_result,
-            )
-
-            retrieval_history.append({
-                "round": round_count,
-                "rank": rank,
-                "subproblems": same_rank_subproblems,
-                "unified_query": unified_query,
-                "contexts": new_contexts,
-                "decomposed_result": decomposed_result,
-            })
-
-            dependency_analysis_history.append({
-                "round": round_count,
-                "rank": rank,
-                "subproblems": same_rank_subproblems,
-                "unified_query": unified_query,
-                "decomposed_result": decomposed_result,
-                "analysis": analysis,
-            })
-
-            if analysis.get("can_answer", False):
-                answer = self.generate_answer(question, info_summary)
-                self.last_dependency_analysis = dependency_analysis_history
-                self.last_retrieval_history = retrieval_history
-                return answer, last_contexts, round_count
-
-        # If max rounds reached or all rank groups processed, generate best possible answer.
         logger.info(
-            f"Reached rank-level retrieval stopping condition "
-            f"({round_count}/{self.max_rounds}). Generating final answer..."
+            f"Parent-answer conditioned rank resolution completed: "
+            f"{round_count} rank rounds."
         )
+
         answer = self.generate_answer(question, info_summary)
         self.last_dependency_analysis = dependency_analysis_history
         self.last_retrieval_history = retrieval_history
