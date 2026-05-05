@@ -64,7 +64,6 @@ Subproblems:
 """
 
 
-
 class LogicRAG(BaseRAG):
     def __init__(
         self, 
@@ -802,6 +801,47 @@ Ans: """
             logger.error(f"{Fore.RED}Error generating answer: {e}{Style.RESET_ALL}")
             return ""
 
+    def compose_final_answer(self, question: str, subanswer_summary: str) -> str:
+        """
+        논문 Algorithm 1의 마지막 단계인 Compose({a_i})를 수행한다.
+
+        입력:
+            question:
+                원 질문 Q.
+
+            subanswer_summary:
+                topological order 기준으로 정렬된 중간 subproblem answer 목록.
+                dag_rank_resolver.py의 final_subanswer_summary를 그대로 넣는다.
+
+        반환:
+            최종 답변 A.
+        """
+        try:
+            prompt = f"""You must compose the final answer using ONLY the intermediate subproblem answers.
+
+Original question:
+{question}
+
+Intermediate subproblem answers in topological order:
+{subanswer_summary}
+
+Rules:
+- Give ONLY the direct final answer.
+- Do not explain.
+- Do not include reasoning steps.
+- Do not include citations.
+- If the answer is a simple yes/no, just say "Yes." or "No."
+- If the answer is a name, date, number, or short phrase, return only that value.
+- Do not invent facts not supported by the intermediate answers.
+
+Final answer:
+"""
+            return get_response_with_retry(prompt).strip()
+
+        except Exception as e:
+            logger.error(f"{Fore.RED}Error composing final answer: {e}{Style.RESET_ALL}")
+            return ""
+
     def _sort_dependencies(self, dependencies: List[str], query) -> List[Tuple]:
         """
         Legacy dependency sorting method.
@@ -1191,7 +1231,13 @@ Output schema:
         finally:
             self.top_k = old_top_k
 
-    def answer_question(self, question: str) -> Tuple[str, List[str], int]:
+    # [보존] 기존 베이스라인 실행 흐름
+    #
+    # 기존 answer_question()의 구현을 그대로 보존한다.
+    # 이 함수는 warm-up retrieval, simple query early return,
+    # info_summary 기반 final answer, 기존 rank-level retrieval 흐름을 포함한다.
+    # 나중에 꼭꼭 삭제 예정.
+    def answer_question_legacy(self, question: str) -> Tuple[str, List[str], int]:
 
         info_summary = "" 
         round_count = 0
@@ -1374,4 +1420,167 @@ Output schema:
         answer = self.generate_answer(question, info_summary)
         self.last_dependency_analysis = dependency_analysis_history
         self.last_retrieval_history = retrieval_history
+        return answer, last_contexts, round_count
+
+    def answer_question(self, question: str) -> Tuple[str, List[str], int]:
+        """
+        논문 baseline 실행 흐름.
+
+        기존 answer_question_legacy()와 다른 점:
+        - warm-up retrieval을 먼저 하지 않는다.
+        - simple query도 바로 return하지 않고 single-node DAG로 처리한다.
+        - Mem(0)=∅ 이므로 resolver에 initial_memory=""를 넘긴다.
+        - max_rounds 기반 early stopping을 쓰지 않고 모든 rank를 처리한다.
+        - final answer는 final_memory가 아니라 Compose({a_i})로 생성한다.
+
+        제외:
+        - 새로운 unresolved subproblem을 발견했을 때 DAG에 node/edge를 추가하는 동적 확장은
+          다른 모듈에서 구현한다.
+        """
+        round_count = 0
+        retrieval_history = []
+        last_contexts = []
+        dependency_analysis_history = []
+        retrieved_chunks_set = set() if self.filter_repeats else None
+
+        print(f"\n\n{Fore.CYAN}{self.MODEL_NAME} answering: {question}{Style.RESET_ALL}\n\n")
+
+        # ===============================================
+        # == Stage 1: query decomposition ==
+        #
+        # 논문 baseline에서는 warm-up retrieval을 먼저 하지 않는다.
+        # simple query도 early return하지 않고, subproblem 1개짜리 DAG로 같은 흐름을 탄다.
+        decomposition = self.decompose_query(question)
+
+        logger.info(
+            f"Query decomposition result: "
+            f"{len(decomposition.get('subproblems', []))} subproblems detected."
+        )
+        logger.info(f"Subproblems: {decomposition.get('subproblems', [])}")
+
+        # ===============================================
+        # == Stage 2: Query Logic DAG construction ==
+        #
+        # decomposition 결과 P를 Query Logic DAG G=(V,E)로 변환한다.
+        dag = self.dag_builder.construct_from_subproblems(
+            question=question,
+            subproblems=decomposition["subproblems"],
+        )
+
+        self.last_query_logic_dag = dag
+
+        dag_dict = dag.to_dict()
+
+        dependency_analysis_history.append({
+            "stage": "query_logic_dag_construction",
+            "query_logic_dag": dag_dict,
+        })
+
+        logger.info(f"Constructed Query Logic DAG: {dag_dict}\n\n")
+
+        # ===============================================
+        # == Stage 3: DAG topological sort + cycle verification ==
+        sorted_dependencies, verified_dag_dict, dag_verification_history = (
+            self._verify_sort_dependencies_with_repair(
+                question=question,
+                dag_dict=dag_dict,
+                max_repair_attempts=self.max_dag_repair_attempts,
+                on_repair_failure=self.dag_cycle_policy,
+            )
+        )
+
+        self.last_query_logic_dag_dict = verified_dag_dict
+
+        final_dag_result = dag_verification_history[-1]["dag_verification"]
+
+        if not final_dag_result.get("is_dag", False):
+            raise DependencyGraphCycleError(final_dag_result)
+
+        # ===============================================
+        # == Stage 4: topological rank calculation ==
+        try:
+            topological_rank_result = compute_topological_ranks_from_verification(
+                final_dag_result
+            )
+
+            verified_dag_dict = attach_topological_ranks_to_dag_dict(
+                verified_dag_dict,
+                topological_rank_result,
+            )
+
+            logger.info(f"Topological rank result: {topological_rank_result}\n\n")
+
+        except TopologicalRankError as e:
+            logger.error(
+                f"{Fore.RED}Failed to compute topological ranks: {e}{Style.RESET_ALL}"
+            )
+            raise
+
+        self.last_query_logic_dag_dict = verified_dag_dict
+
+        dependency_analysis_history.append({
+            "stage": "dag_verification_and_topological_ranking",
+            "query_logic_dag": dag_dict,
+            "verified_query_logic_dag": verified_dag_dict,
+            "dag_verification_history": dag_verification_history,
+            "topological_rank": topological_rank_result,
+            "sorted_dependencies": sorted_dependencies,
+        })
+
+        logger.info(f"Verified Query Logic DAG: {verified_dag_dict}\n\n")
+        logger.info(f"Sorted dependencies: {sorted_dependencies}\n\n")
+
+        # ===============================================
+        # == Stage 5: parent-answer conditioned retrieval + rolling memory ==
+        #
+        # 논문 baseline:
+        # - Mem(0)=∅ 이므로 initial_memory=""를 넘긴다.
+        # - 모든 topological rank를 오름차순으로 한 번씩 처리한다.
+        # - 기존 max_rounds 기반 early stopping은 사용하지 않는다.
+        # - 각 rank group은 한 번 처리되므로 rank-batch 단위 sampling without replacement가 된다.
+        rank_resolver = ParentConditionedRankResolver(self)
+
+        stage5_result = rank_resolver.run(
+            question=question,
+            dag_result=final_dag_result,
+            topological_rank_result=topological_rank_result,
+            sorted_dependencies=sorted_dependencies,
+            initial_memory="",
+            retrieved_chunks_set=retrieved_chunks_set,
+            max_rounds=None,
+        )
+
+        last_contexts = stage5_result["last_contexts"]
+        round_count = stage5_result["round_count"]
+        retrieval_history = stage5_result["retrieval_history"]
+        final_subanswer_summary = stage5_result["final_subanswer_summary"]
+
+        dependency_analysis_history.append({
+            "stage": "parent_answer_conditioned_rank_resolution_with_rolling_memory",
+            "rank_groups": stage5_result["rank_groups"],
+            "processed_rank_groups": stage5_result["processed_rank_groups"],
+            "resolved_answers_by_node_id": stage5_result["resolved_answers_by_node_id"],
+            "final_memory": stage5_result["final_memory"],
+            "final_subanswer_summary": final_subanswer_summary,
+            "retrieval_history": retrieval_history,
+        })
+
+        logger.info(
+            f"Parent-answer conditioned rank resolution completed: "
+            f"{round_count} rank rounds."
+        )
+
+        # ===============================================
+        # == Stage 6: final answer composition ==
+        #
+        # 논문 Algorithm 1:
+        # A = Compose({a_i})
+        answer = self.compose_final_answer(
+            question=question,
+            subanswer_summary=final_subanswer_summary,
+        )
+
+        self.last_dependency_analysis = dependency_analysis_history
+        self.last_retrieval_history = retrieval_history
+
         return answer, last_contexts, round_count
