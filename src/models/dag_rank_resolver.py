@@ -7,9 +7,12 @@ LogicRAG의 DAG rank 단위 retrieval / resolution 모듈.
 - Eq. (3): rolling memory 기반 context pruning
 - Eq. (4): same-rank unified query 기반 graph pruning
 - Algorithm 1의 rank 순차 처리 및 중간 답 저장
+- Algorithm 1 line 14-17의 Dynamic DAG Adaptation
+  (run() 메서드에 dag와 max_dynamic_adaptations 인자가 함께 전달된 경우에만 작동.
+   기본값으로 호출하면 기존 동작 그대로 유지된다.)
 
-제외 범위:
-- Algorithm 1의 새로운 unresolved subproblem 동적 추가는 다른 모듈에서 담당한다.
+Dynamic DAG Adaptation은 LogicRAG._maybe_add_subproblem()이 담당하고,
+resolver는 매 rank 처리 후 해당 메서드를 hook으로 호출한다.
 """
 
 from __future__ import annotations
@@ -171,10 +174,6 @@ def build_rank_groups_with_nodes(
             },
             ...
         ]
-
-    중요한 점:
-    - parent answer를 찾으려면 subproblem text만으로는 부족하다.
-    - 반드시 node_id를 함께 보존해야 한다.
     """
     node_text_by_id = build_node_text_by_id(dag_result)
 
@@ -223,8 +222,6 @@ def build_rank_groups_with_nodes(
                     "subproblems": [node["subproblem"] for node in nodes],
                 })
 
-    # rank_groups가 없을 때의 fallback.
-    # 정상 논문 baseline에서는 topological_rank_result["rank_groups"]가 있어야 한다.
     if not groups:
         sorted_node_ids = [
             node_id
@@ -281,12 +278,6 @@ def collect_parent_answers_for_nodes(
 ) -> Dict[int, List[Dict[str, Any]]]:
     """
     현재 rank에 있는 각 node에 대해 이미 해결된 parent answer들을 모은다.
-
-    논문 Eq. (1) 대응:
-        현재 subproblem retrieval은 parent node들의 이전 answer에 condition된다.
-
-    여기서 parent answer는 answer 생성 prompt에 직접 넣기보다는
-    retrieval query를 구체화하는 데 사용한다.
     """
     parent_answers_by_node_id: Dict[int, List[Dict[str, Any]]] = {}
 
@@ -330,6 +321,8 @@ class ParentConditionedRankResolver:
     - retrieved context를 rolling memory로 요약한다.
     - rolling memory로 현재 rank의 node answer를 생성한다.
     - generated answer를 다음 rank용 rolling memory에 반영한다.
+    - [확장] 매 rank 처리 후 LogicRAG._maybe_add_subproblem()을 hook으로 호출하여
+      Dynamic DAG Adaptation (Algorithm 1 line 14-17)을 수행한다.
     """
 
     def __init__(self, rag: Any):
@@ -340,9 +333,7 @@ class ParentConditionedRankResolver:
         nodes: List[Dict[str, Any]],
         parent_answers_by_node_id: Dict[int, List[Dict[str, Any]]],
     ) -> List[Dict[str, Any]]:
-        """
-        unified query 생성과 memory 요약 prompt에 넣을 rank payload를 만든다.
-        """
+        """unified query 생성과 memory 요약 prompt에 넣을 rank payload를 만든다."""
         payload: List[Dict[str, Any]] = []
 
         for node in nodes:
@@ -360,12 +351,7 @@ class ParentConditionedRankResolver:
 
     @staticmethod
     def _nodes_payload(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        answer 생성 prompt에 넣을 node 목록을 정리한다.
-
-        parent answer는 retrieval query conditioning에 이미 사용되므로,
-        answer prompt에는 node_id와 subproblem text만 넣는다.
-        """
+        """answer 생성 prompt에 넣을 node 목록을 정리한다."""
         payload: List[Dict[str, Any]] = []
 
         for node in nodes:
@@ -389,11 +375,7 @@ class ParentConditionedRankResolver:
         nodes: List[Dict[str, Any]],
         parent_answers_by_node_id: Dict[int, List[Dict[str, Any]]],
     ) -> str:
-        """
-        LLM query merge가 실패했을 때 쓰는 deterministic fallback query.
-
-        parent answer가 있으면 반드시 query 문자열에 포함한다.
-        """
+        """LLM query merge가 실패했을 때 쓰는 deterministic fallback query."""
         payload = ParentConditionedRankResolver._rank_payload(
             nodes=nodes,
             parent_answers_by_node_id=parent_answers_by_node_id,
@@ -427,18 +409,7 @@ class ParentConditionedRankResolver:
         nodes: List[Dict[str, Any]],
         parent_answers_by_node_id: Dict[int, List[Dict[str, Any]]],
     ) -> str:
-        """
-        논문 Eq. (1)과 Eq. (4)를 함께 구현한다.
-
-        Eq. (4):
-            같은 rank의 subproblem S(r)을 하나의 unified query로 merge한다.
-
-        Eq. (1):
-            각 subproblem의 retrieval은 parent answer에 condition된다.
-
-        rank-level 구현:
-            q(r) = Merge(S(r), 각 node의 resolved parent answers)
-        """
+        """논문 Eq. (1)과 Eq. (4)를 함께 구현한다."""
         nodes = [
             {
                 "node_id": _as_int(node.get("node_id")),
@@ -532,15 +503,7 @@ Output schema:
         contexts: List[str],
         previous_memory: str = "",
     ) -> str:
-        """
-        논문 Eq. (3)과 Algorithm 1의 rolling memory update를 구현한다.
-
-        흐름:
-            C(r) = R(q(r))
-            Mem(r) = Summarize(Mem(r-1) ∪ C(r))
-
-        이 memory는 현재 rank의 subproblem answer를 생성하는 데 사용된다.
-        """
+        """논문 Eq. (3)과 Algorithm 1의 rolling memory update를 구현한다."""
         context_text = "\n\n".join(contexts or [])
 
         rank_payload = self._rank_payload(
@@ -618,17 +581,7 @@ Output schema:
         unified_query: str,
         memory: str,
     ) -> Dict[str, Any]:
-        """
-        논문 Algorithm 1의 subproblem resolution 단계를 구현한다.
-
-        각 p_i ∈ S(r)에 대해:
-            Mem(r)를 사용해 p_i의 중간 답 a_i를 생성한다.
-
-        주의:
-        - raw retrieved context를 직접 넣지 않는다.
-        - parent answer를 answer prompt에 직접 넣지 않는다.
-        - parent answer는 retrieval query conditioning 단계에서 이미 사용되었다.
-        """
+        """논문 Algorithm 1의 subproblem resolution 단계를 구현한다."""
         nodes = [
             {
                 "node_id": _as_int(node.get("node_id")),
@@ -805,15 +758,7 @@ Output schema:
         memory_for_resolution: str,
         rank_result: Dict[str, Any],
     ) -> str:
-        """
-        Framework 본문의 context pruning 설명을 반영한다.
-
-        논문 본문은 subproblem이 resolved된 뒤,
-        그 retrieved context와 answer a_i를 LLM summarization으로 distill해
-        rolling memory에 반영한다고 설명한다.
-
-        이 함수는 현재 rank의 answer들을 다음 rank에서 쓸 memory에 반영한다.
-        """
+        """Framework 본문의 context pruning 설명을 반영한다."""
         context_text = "\n\n".join(contexts or [])
         nodes_payload = self._nodes_payload(nodes)
         rank_result_text = json.dumps(rank_result, ensure_ascii=False, indent=2)
@@ -887,12 +832,7 @@ Output schema:
         dag_result: Dict[str, Any],
         resolved_answers_by_node_id: Dict[int, Dict[str, Any]],
     ) -> str:
-        """
-        최종 answer composition에 넣을 node별 중간 답 요약을 만든다.
-
-        논문 Algorithm 1:
-            A = Compose({a_i})
-        """
+        """최종 answer composition에 넣을 node별 중간 답 요약을 만든다."""
         sorted_node_ids = [
             node_id
             for node_id in (
@@ -932,18 +872,37 @@ Output schema:
         initial_memory: str = "",
         retrieved_chunks_set: Optional[set] = None,
         max_rounds: Optional[int] = None,
+        # [추가] Dynamic DAG Adaptation을 위한 옵셔널 인자
+        # dag와 max_dynamic_adaptations가 함께 제공된 경우에만 dynamic adaptation이 작동한다.
+        # 기본값으로 호출하면 기존 동작 그대로 유지된다 (하위 호환성).
+        dag: Optional[Any] = None,
+        max_dynamic_adaptations: int = 0,
     ) -> Dict[str, Any]:
         """
         Parent-answer conditioned rank-level LogicRAG resolution.
 
-        논문 baseline:
-        - initial_memory=""이면 Mem(0)=∅ 이다.
-        - max_rounds=None이면 모든 topological rank를 처리한다.
-        - 각 rank group은 한 번만 처리한다.
-        - 따라서 rank-batch 단위 sampling without replacement가 된다.
+        매 rank 처리 후 Dynamic DAG Adaptation hook 호출:
+        - dag와 max_dynamic_adaptations가 함께 제공된 경우에만 발동.
+        - LogicRAG._maybe_add_subproblem()을 호출하여 새 sub 필요 여부 판정.
+        - 새 sub가 추가되면 rank_groups_to_process에 append하여 루프가 자동 연장된다.
+        - max_dynamic_adaptations 안전장치로 무한 추가 방지.
 
-        max_rounds는 기존 코드 호환을 위해 남겨둔다.
-        논문 baseline에서는 logic_rag.py에서 max_rounds=None을 넘긴다.
+        Args:
+            question: 원래 질문 Q.
+            dag_result: verify_non_cyclicity의 검증 결과 dict.
+            topological_rank_result: dag_topological_rank의 결과 dict.
+            sorted_dependencies: fallback용 정렬된 의존 리스트.
+            initial_memory: Mem(0). 논문 baseline에서는 ∅(빈 문자열).
+            retrieved_chunks_set: filter_repeats용 retrieved chunk 집합.
+            max_rounds: rank 처리 최대 횟수. None이면 모든 rank 처리.
+            dag: QueryLogicDAG 객체. dynamic adaptation 시 mutate된다.
+            max_dynamic_adaptations: dynamic adaptation 최대 발동 횟수.
+
+        Returns:
+            stage5 결과 dict. 다음 키 포함:
+            - rank_groups, processed_rank_groups, resolved_answers_by_node_id,
+              retrieval_history, last_contexts, round_count, final_memory,
+              final_subanswer_summary, dynamic_adaptations
         """
         if not dag_result.get("is_dag", False):
             raise ValueError("Parent-conditioned rank resolution requires a valid DAG.")
@@ -968,7 +927,18 @@ Output schema:
         retrieval_history: List[Dict[str, Any]] = []
         last_contexts: List[str] = []
 
-        for round_idx, rank_group in enumerate(rank_groups_to_process, start=1):
+        # [추가] Dynamic DAG Adaptation 상태 변수
+        dynamic_adaptations_log: List[Dict[str, Any]] = []
+        adaptation_count = 0
+
+        # [변경] for-enumerate 대신 while-index 패턴.
+        # rank_groups_to_process에 매 iteration 끝에 append할 수 있으므로
+        # 명시적으로 list 길이를 매번 확인한다.
+        idx = 0
+        while idx < len(rank_groups_to_process):
+            rank_group = rank_groups_to_process[idx]
+            round_idx = idx + 1
+
             rank = int(rank_group["rank"])
             nodes = rank_group.get("nodes", []) or []
             subproblems = rank_group.get("subproblems", []) or [
@@ -979,7 +949,6 @@ Output schema:
             memory_before_rank = memory
 
             # 1. 부모 node 답을 수집한다.
-            #    이 값은 answer 생성용이 아니라 retrieval query conditioning용이다.
             parent_answers_by_node_id = collect_parent_answers_for_nodes(
                 nodes=nodes,
                 parent_ids_by_node_id=parent_ids_by_node_id,
@@ -988,7 +957,6 @@ Output schema:
             )
 
             # 2. 같은 rank의 subproblem을 하나의 unified query로 묶는다.
-            #    이때 각 node의 parent answer를 query 생성에 반영한다.
             unified_query = self.build_parent_conditioned_unified_query(
                 question=question,
                 rank=rank,
@@ -1024,7 +992,6 @@ Output schema:
             )
 
             # 6. node_id 기준으로 중간 답을 저장한다.
-            #    다음 rank의 parent-answer conditioned retrieval과 final Compose({a_i})에 사용된다.
             for node_answer in rank_result.get("node_answers", []) or []:
                 node_id = _as_int(node_answer.get("node_id"))
                 if node_id is None:
@@ -1032,8 +999,7 @@ Output schema:
 
                 resolved_answers_by_node_id[node_id] = node_answer
 
-            # 7. Framework 본문 설명에 맞게 retrieved context와 generated answer를
-            #    다음 rank용 rolling memory에 반영한다.
+            # 7. retrieved context와 generated answer를 다음 rank용 rolling memory에 반영한다.
             memory_after_rank = self.distill_rank_result_to_memory(
                 question=question,
                 rank=rank,
@@ -1060,6 +1026,76 @@ Output schema:
                 "rank_result": rank_result,
             })
 
+            # ─── 8. [추가] Dynamic DAG Adaptation hook ───
+            # 논문 Algorithm 1 line 14-17 구현.
+            # dag와 max_dynamic_adaptations가 함께 제공된 경우에만 작동.
+            # LogicRAG._maybe_add_subproblem()을 호출하여 새 sub 필요 여부 판정.
+            # 새 sub가 추가되면 rank_groups_to_process에 append하여 다음 iteration에서 처리됨.
+            if (
+                dag is not None
+                and max_dynamic_adaptations > 0
+                and adaptation_count < max_dynamic_adaptations
+            ):
+                # 부모 rank 조회용으로 현재까지의 max rank 계산
+                current_max_rank = max(
+                    (int(g["rank"]) for g in rank_groups_to_process),
+                    default=rank,
+                )
+
+                # node_id -> answer string 형태로 변환
+                # (LogicRAG._maybe_add_subproblem이 요구하는 sub_answers 형식)
+                sub_answers_for_hook: Dict[int, str] = {}
+                for node_id, answer_dict in resolved_answers_by_node_id.items():
+                    if not isinstance(answer_dict, dict):
+                        continue
+                    answer_text = _clean_text(answer_dict.get("answer", ""))
+                    if answer_text:
+                        sub_answers_for_hook[node_id] = answer_text
+
+                try:
+                    new_sub_info = self.rag._maybe_add_subproblem(
+                        question=question,
+                        info_summary=memory,
+                        dag=dag,
+                        sub_answers=sub_answers_for_hook,
+                        current_max_rank=current_max_rank,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Error during dynamic adaptation hook: %s", e
+                    )
+                    new_sub_info = None
+
+                if new_sub_info is not None:
+                    new_id = new_sub_info["new_subproblem_id"]
+                    new_rank = new_sub_info["new_rank"]
+                    new_text = new_sub_info["new_subproblem_text"]
+
+                    # 새 rank group을 list에 append하여 루프가 자동 연장되게 함
+                    new_rank_group = {
+                        "rank": new_rank,
+                        "nodes": [{
+                            "node_id": new_id,
+                            "subproblem": new_text,
+                        }],
+                        "subproblems": [new_text],
+                    }
+                    rank_groups_to_process.append(new_rank_group)
+
+                    # 다음 rank 처리 시 부모 답 조회를 위해 mapping 업데이트
+                    node_text_by_id[new_id] = new_text
+                    parent_ids_by_node_id[new_id] = list(new_sub_info.get("depends_on", []))
+
+                    adaptation_count += 1
+                    dynamic_adaptations_log.append({
+                        "after_round": round_idx,
+                        "after_rank": rank,
+                        "adaptation_index": adaptation_count,
+                        "added_subproblem": new_sub_info,
+                    })
+
+            idx += 1
+
         final_subanswer_summary = self.build_final_subanswer_summary(
             dag_result=dag_result,
             resolved_answers_by_node_id=resolved_answers_by_node_id,
@@ -1074,4 +1110,6 @@ Output schema:
             "round_count": len(retrieval_history),
             "final_memory": memory,
             "final_subanswer_summary": final_subanswer_summary,
+            # [추가] Dynamic DAG Adaptation 발동 이력
+            "dynamic_adaptations": dynamic_adaptations_log,
         }
