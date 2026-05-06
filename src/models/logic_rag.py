@@ -20,6 +20,7 @@ from src.models.dag_topological_rank import (
     attach_topological_ranks_to_dag_dict,
     TopologicalRankError,
 )
+from src.models.dag_rank_resolver import ParentConditionedRankResolver
 from src.utils.utils import get_response_with_retry, fix_json_response
 from colorama import Fore, Style, init
 
@@ -29,7 +30,9 @@ init()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Few-shot 예시 상수 (논문 Section 3.2)
+# [추가] Few-shot 예시 상수 (논문 Section 3.2)
+# decompose_query()의 프롬프트에서 참조
+# subproblems 형식: {"id", "text"} → QueryLogicDAGBuilder 입력 형식에 맞춤
 QUERY_DECOMPOSITION_FEW_SHOT_EXAMPLES = """
 Example 1:
 Question: "Who is the mayor of the capital of France?"
@@ -76,25 +79,36 @@ class LogicRAG(BaseRAG):
         """Initialize the LogicRAG system."""
         super().__init__(corpus_path, cache_dir)
 
-        self.max_rounds = 3
+        self.max_rounds = 3  # rank-level retrieval round의 최대 횟수
         self.MODEL_NAME = "LogicRAG"
-        self.filter_repeats = filter_repeats
+        self.filter_repeats = filter_repeats  # Option to filter repeated chunks across rounds
 
+        # Query decomposition 담당자가 만든 decompose_query()의 결과인 subproblems를 Query Logic DAG G=(V,E)로 변환하기 위한 Builder.
+        # 여기서는 decomposition["subproblems"]를 DAG Builder에 연결하는 역할만 한다.
         self.dag_builder = QueryLogicDAGBuilder()
+
+        # 마지막으로 생성된 Query Logic DAG를 평가/디버깅용으로 저장한다.
         self.last_query_logic_dag = None
 
+        # DAG verification / repair settings
         self.max_dag_repair_attempts = 1
-        self.dag_cycle_policy = "raise"
+        self.dag_cycle_policy = "raise"  # "raise" or "fallback"
 
-        # Dynamic DAG adaptation 안전장치.
+        # [추가] Dynamic DAG adaptation 안전장치
         # 한 질문 처리 도중 새 subproblem을 몇 번까지 추가할 수 있는지의 상한.
+        # 무한 확장으로 인한 token cost 폭주를 방지하는 안전장치.
+        # resolver.run()에 max_dynamic_adaptations 인자로 전달된다.
         self.max_dynamic_adaptations = 3
 
     def set_max_rounds(self, max_rounds: int):
+        """Set the maximum number of retrieval rounds."""
         self.max_rounds = max_rounds
 
     def refine_summary_with_context(self, question: str, new_contexts: List[str],
                                   current_summary: str = "") -> str:
+        """
+        Generate a new summary or refine an existing one based on newly retrieved contexts.
+        """
         try:
             context_text = "\n".join(new_contexts)
 
@@ -133,7 +147,8 @@ Your refined summary should:
 
 Refined summary:"""
 
-            return get_response_with_retry(prompt)
+            summary = get_response_with_retry(prompt)
+            return summary
 
         except Exception as e:
             logger.error(f"{Fore.RED}Error generating/refining summary: {e}{Style.RESET_ALL}")
@@ -142,7 +157,9 @@ Refined summary:"""
             return context_text
 
     def warm_up_analysis(self, question: str, info_summary: str) -> Dict:
-        """[Legacy] warm-up analysis (현재 흐름에서는 decompose_query()로 대체됨)."""
+        """
+        This is a warm-up analysis, which is used to analyze if the question can be answered with simple fact retrieval, without any dependency analysis.
+        """
         try:
             prompt = f"""Question: {question}
 
@@ -172,7 +189,9 @@ Please format your response as a JSON object with these keys:
             result = fix_json_response(response)
             if result is None:
                 return {
-                    "can_answer": True, "missing_info": "", "subquery": question,
+                    "can_answer": True,
+                    "missing_info": "",
+                    "subquery": question,
                     "current_understanding": "Failed to parse reflection response.",
                     "dependencies": ["Information relevant to the question"],
                     "missing_reason": "Parse error occurred"
@@ -189,6 +208,7 @@ Please format your response as a JSON object with these keys:
                 result["missing_reason"] = "Additional context needed" if not result["can_answer"] else "No missing information"
 
             result["can_answer"] = bool(result["can_answer"])
+
             if not result["subquery"]:
                 result["subquery"] = question
 
@@ -197,15 +217,21 @@ Please format your response as a JSON object with these keys:
         except Exception as e:
             logger.error(f"{Fore.RED}Error in analyze_dependency_graph: {e}{Style.RESET_ALL}")
             return {
-                "can_answer": True, "missing_info": "", "subquery": question,
+                "can_answer": True,
+                "missing_info": "",
+                "subquery": question,
                 "current_understanding": f"Error during analysis: {str(e)}",
                 "dependencies": ["Information relevant to the question"],
                 "missing_reason": "Analysis error occurred"
             }
 
-    # 논문 Section 3.2 - Query Decomposition Prompting
+    # [추가] 논문 Section 3.2 - Query Decomposition Prompting
     # subproblem 분해 + Few-shot prompting을 하나의 Task로 합침
+    # 출력된 subproblems는 QueryLogicDAGBuilder.construct_from_subproblems()의 input으로 전달됨
     def decompose_query(self, question: str) -> Dict:
+        """
+        Decompose the input query into subproblems using few-shot prompting.
+        """
         try:
             prompt = f"""You are an expert at decomposing complex questions into smaller, logically ordered subproblems.
 
@@ -245,7 +271,9 @@ Respond ONLY with the JSON object, no additional text."""
             return {"subproblems": [{"id": 0, "text": question}], "is_simple": True}
 
     def dependency_aware_rag(self, question: str, info_summary: str, dependencies: List[str], idx: int) -> str:
-        """[Legacy] dependency-aware analysis (현재 흐름에서는 사용되지 않음)."""
+        """
+        [Legacy] dependency-aware analysis (현재 흐름에서는 사용되지 않음).
+        """
         try:
             prompt = f"""
             We pre-parsed the question into a list of dependencies, and the dependencies are sorted in a topological order, below is the question, the information summary, and the decomposed dependencies:
@@ -271,7 +299,8 @@ Respond ONLY with the JSON object, no additional text."""
             - "current_understanding": string
             """
             response = get_response_with_retry(prompt)
-            return fix_json_response(response)
+            result = fix_json_response(response)
+            return result
         except Exception as e:
             logger.error(f"{Fore.RED}Error in dependency_aware_rag: {e}{Style.RESET_ALL}")
             return {
@@ -281,6 +310,7 @@ Respond ONLY with the JSON object, no additional text."""
 
     @staticmethod
     def _deduplicate_nonempty_strings(items: List[Any]) -> List[str]:
+        """문자열 list를 정리하고 순서를 유지한 채 중복을 제거"""
         cleaned: List[str] = []
         seen = set()
 
@@ -629,8 +659,9 @@ Return ONLY a JSON object with these keys:
             }
 
     # ==================================================================
-    # Dynamic DAG Adaptation 관련 헬퍼
+    # [추가] Dynamic DAG Adaptation 관련 헬퍼
     # 논문 Algorithm 1 line 14–17, Section 3.2 ❸ 구현
+    # resolver.run()의 매 rank 처리 후 hook으로 호출된다.
     # ==================================================================
 
     def _match_node_id_by_text(
@@ -642,8 +673,8 @@ Return ONLY a JSON object with these keys:
         DAG의 V에서 주어진 text와 일치하는 node id 반환.
         대소문자/공백 무시 매칭.
 
-        decompose_unified_context_by_subproblem이 반환한 subproblem text를
-        DAG node id로 역매핑할 때 사용.
+        _maybe_add_subproblem 안에서 새 sub가 기존 sub와 중복인지
+        검증할 때 사용한다.
 
         Args:
             dag: QueryLogicDAG 객체.
@@ -673,9 +704,9 @@ Return ONLY a JSON object with these keys:
         """
         논문 Algorithm 1 line 14–17 + Section 3.2 ❸ Dynamic Adaptation 구현.
 
-        매 rank 처리 직후 호출되어, 현재까지의 정보로 원 질문에 답할 수 있는지
-        LLM에게 판정 요청한다. 새 subproblem이 필요하면 DAG에 추가하고
-        그 정보를 반환한다.
+        ParentConditionedRankResolver.run()의 매 rank 처리 직후 hook으로 호출된다.
+        현재까지의 정보로 원 질문에 답할 수 있는지 LLM에게 판정 요청하고,
+        새 subproblem이 필요하면 DAG에 추가한다.
 
         새 노드는 항상 max(기존 id) + 1 위치에 추가되고, edge는
         기존 노드 → 새 노드 방향만 만들어지므로 cycle은 구조적으로 불가능.
@@ -861,16 +892,12 @@ Output format (JSON ONLY, no other text):
             "reason": reason,
         }
 
-    # ==================================================================
-    # ranked subproblem groups 추출 헬퍼
-    # ==================================================================
-
     @staticmethod
     def _ranked_subproblem_groups(
         topological_rank_result: Dict[str, Any],
         sorted_dependencies: List[str],
     ) -> List[Dict[str, Any]]:
-        """Topological rank 결과를 unified retrieval loop에서 돌기 쉬운 형태로 변환."""
+        """ Topological rank 결과를 unified retrieval loop에서 돌기 쉬운 형태로 변환하는 역할 """
         ranked_dependencies = topological_rank_result.get("ranked_dependencies", {}) if topological_rank_result else {}
         groups: List[Dict[str, Any]] = []
 
@@ -913,7 +940,7 @@ Output format (JSON ONLY, no other text):
         query: str,
         retrieved_chunks_set: Optional[set] = None,
     ) -> List[str]:
-        """unified query 하나를 실제 retrieval에 넘기는 wrapper 함수."""
+        """ unified query 하나를 실제 retrieval에 넘기는 wrapper 함수 """
         if self.filter_repeats and retrieved_chunks_set is not None:
             contexts = self._retrieve_with_filter(query, retrieved_chunks_set)
             for chunk in contexts:
@@ -923,7 +950,7 @@ Output format (JSON ONLY, no other text):
         return self.retrieve(query)
 
     def generate_answer(self, question: str, info_summary: str) -> str:
-        """Generate final answer based on the information summary (논문 line 19: Compose)."""
+        """Generate final answer based on the information summary."""
         try:
             prompt = f"""You must give ONLY the direct answer in the most concise way possible. DO NOT explain or provide any additional context.
 If the answer is a simple yes/no, just say "Yes." or "No."
@@ -939,9 +966,40 @@ Information Summary:
 
 Remember: Be concise - give ONLY the essential answer, nothing more.
 Ans: """
+
             return get_response_with_retry(prompt)
         except Exception as e:
             logger.error(f"{Fore.RED}Error generating answer: {e}{Style.RESET_ALL}")
+            return ""
+
+    def compose_final_answer(self, question: str, subanswer_summary: str) -> str:
+        """
+        논문 Algorithm 1의 마지막 단계인 Compose({a_i})를 수행한다.
+        """
+        try:
+            prompt = f"""You must compose the final answer using ONLY the intermediate subproblem answers.
+
+Original question:
+{question}
+
+Intermediate subproblem answers in topological order:
+{subanswer_summary}
+
+Rules:
+- Give ONLY the direct final answer.
+- Do not explain.
+- Do not include reasoning steps.
+- Do not include citations.
+- If the answer is a simple yes/no, just say "Yes." or "No."
+- If the answer is a name, date, number, or short phrase, return only that value.
+- Do not invent facts not supported by the intermediate answers.
+
+Final answer:
+"""
+            return get_response_with_retry(prompt).strip()
+
+        except Exception as e:
+            logger.error(f"{Fore.RED}Error composing final answer: {e}{Style.RESET_ALL}")
             return ""
 
     def _sort_dependencies(self, dependencies: List[str], query) -> List[Tuple]:
@@ -961,18 +1019,23 @@ Ans: """
         response = get_response_with_retry(prompt)
         result = fix_json_response(response)
         dependency_pairs = result["dependency_pairs"]
-        return self._topological_sort(dependencies, dependency_pairs)
+        sorted_dependencies = self._topological_sort(dependencies, dependency_pairs)
+        return sorted_dependencies
 
     @staticmethod
     def _get_dag_node_edge_keys(dag_dict: Dict[str, Any]) -> Tuple[str, str]:
+        """DAG dict에서 node field와 edge field 이름 찾기"""
         if "nodes" in dag_dict and "edges" in dag_dict:
             return "nodes", "edges"
+
         if "V" in dag_dict and "E" in dag_dict:
             return "V", "E"
+
         raise ValueError("DAG dict must have either nodes/edges or V/E.")
 
     @staticmethod
     def _nodes_payload_from_dag_dict(dag_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """LLM repair prompt용 node 리스트 생성"""
         node_key, _ = LogicRAG._get_dag_node_edge_keys(dag_dict)
         raw_nodes = dag_dict[node_key]
 
@@ -998,6 +1061,7 @@ Ans: """
 
     @staticmethod
     def _rebuild_dag_indexes_dict(dag_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """LLM이 edge를 수정하면 parents / children 다시 계산"""
         node_key, edge_key = LogicRAG._get_dag_node_edge_keys(dag_dict)
 
         raw_nodes = dag_dict[node_key]
@@ -1058,7 +1122,7 @@ Ans: """
         dag_dict: Dict[str, Any],
         dag_result: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """cycle 있는 DAG → LLM에게 고쳐달라고 요청."""
+        """cycle 있는 DAG → LLM에게 고쳐달라고 요청"""
         _, edge_key = self._get_dag_node_edge_keys(dag_dict)
 
         nodes_payload = self._nodes_payload_from_dag_dict(dag_dict)
@@ -1166,7 +1230,7 @@ Output schema:
         max_repair_attempts: int = 1,
         on_repair_failure: str = "raise",
     ) -> Tuple[List[str], Dict[str, Any], List[Dict[str, Any]]]:
-        """DAG 검증 + topological sort + cycle repair orchestration."""
+        """DAG 검증 + topological sort + cycle repair orchestration"""
         if on_repair_failure not in {"raise", "fallback"}:
             raise ValueError("on_repair_failure must be either 'raise' or 'fallback'.")
 
@@ -1236,7 +1300,7 @@ Output schema:
         raise DependencyGraphCycleError(dag_result)
 
     def _retrieve_with_filter(self, query: str, retrieved_chunks_set: set) -> list:
-        """context chunk에 대한 Sampling without Replacement."""
+        """context chunk에 대한 Sampling without Replacement"""
         if retrieved_chunks_set is None:
             retrieved_chunks_set = set()
 
@@ -1266,7 +1330,7 @@ Output schema:
         return unique_results[:target_k]
 
     def _retrieve_top_n(self, query: str, n: int) -> list:
-        """query에 대해 top-n 결과 검색."""
+        """query에 대해 top-n 결과 검색"""
         old_top_k = self.top_k
         try:
             self.top_k = min(int(n), len(self.corpus))
@@ -1274,11 +1338,8 @@ Output schema:
         finally:
             self.top_k = old_top_k
 
-    # ==================================================================
-    # 메인 진입점 (논문 Algorithm 1 그대로 따름)
-    # ==================================================================
-
-    def answer_question(self, question: str) -> Tuple[str, List[str], int]:
+    # [보존] 기존 베이스라인 실행 흐름. 나중에 삭제 예정.
+    def answer_question_legacy(self, question: str) -> Tuple[str, List[str], int]:
 
         info_summary = ""
         round_count = 0
@@ -1289,10 +1350,6 @@ Output schema:
 
         print(f"\n\n{Fore.CYAN}{self.MODEL_NAME} answering: {question}{Style.RESET_ALL}\n\n")
 
-        # ===============================================
-        # == Stage 1: warm up retrieval + decompose_query ==
-        # 논문 Algorithm 1 line 1: decompose Q into subproblems P
-        # ===============================================
         if self.filter_repeats:
             new_contexts = self._retrieve_with_filter(question, retrieved_chunks_set)
             for chunk in new_contexts:
@@ -1318,10 +1375,6 @@ Output schema:
             logger.info(f"Query decomposition result: {len(decomposition['subproblems'])} subproblems detected.")
             logger.info(f"Subproblems: {decomposition['subproblems']}")
 
-            # ===============================================
-            # == Stage 2: Build Query Logic DAG ==
-            # 논문 Algorithm 1 line 2–3: Initialize DAG, populate edges
-            # ===============================================
             dag = self.dag_builder.construct_from_subproblems(
                 question=question,
                 subproblems=decomposition["subproblems"],
@@ -1335,9 +1388,6 @@ Output schema:
         })
         logger.info(f"Constructed Query Logic DAG: {dag_dict}\n\n")
 
-        # ===============================================
-        # == Stage 3: DAG topological sort + cycle verification ==
-        # ===============================================
         sorted_dependencies, verified_dag_dict, dag_verification_history = (
             self._verify_sort_dependencies_with_repair(
                 question=question,
@@ -1349,10 +1399,6 @@ Output schema:
 
         self.last_query_logic_dag_dict = verified_dag_dict
 
-        # ===============================================
-        # == Stage 4: Topological rank calculation ==
-        # 논문 Algorithm 1 line 4: Topologically sort G to obtain ranks
-        # ===============================================
         final_dag_result = dag_verification_history[-1]["dag_verification"]
 
         if final_dag_result.get("is_dag", False):
@@ -1360,26 +1406,11 @@ Output schema:
                 topological_rank_result = compute_topological_ranks_from_verification(
                     final_dag_result
                 )
-
                 verified_dag_dict = attach_topological_ranks_to_dag_dict(
                     verified_dag_dict,
                     topological_rank_result,
                 )
-
-                # dag 객체 내부의 ranks dict도 함께 채워둔다.
-                # _maybe_add_subproblem이 dag.ranks.get()으로 부모 rank를 조회하므로 필요.
-                ranks_payload = topological_rank_result.get("ranks", {}) or {}
-                for raw_id, raw_rank in ranks_payload.items():
-                    try:
-                        node_id = int(raw_id)
-                        rank_val = int(raw_rank)
-                    except (TypeError, ValueError):
-                        continue
-                    if node_id in dag.V:
-                        dag.ranks[node_id] = rank_val
-
                 logger.info(f"Topological rank result: {topological_rank_result}\n\n")
-
             except TopologicalRankError as e:
                 logger.error(
                     f"{Fore.RED}Failed to compute topological ranks: {e}{Style.RESET_ALL}"
@@ -1404,158 +1435,221 @@ Output schema:
         logger.info(f"Verified Query Logic DAG: {verified_dag_dict}\n\n")
         logger.info(f"Sorted dependencies: {sorted_dependencies}\n\n")
 
-        # ===============================================
-        # == Stage 5: rank-level unified retrieval +
-        #             Dynamic DAG Adaptation
-        # 논문 Algorithm 1 line 6–18: for each rank r in ascending topological order
-        # ===============================================
-        ranked_subproblem_groups = self._ranked_subproblem_groups(
+        rank_processing_limit = None
+        rank_resolver = ParentConditionedRankResolver(self)
+
+        stage5_result = rank_resolver.run(
+            question=question,
+            dag_result=final_dag_result,
             topological_rank_result=topological_rank_result,
             sorted_dependencies=sorted_dependencies,
+            initial_memory=info_summary,
+            retrieved_chunks_set=retrieved_chunks_set,
+            max_rounds=rank_processing_limit,
         )
+
+        info_summary = stage5_result["final_memory"]
+        last_contexts = stage5_result["last_contexts"]
+        round_count = stage5_result["round_count"]
+        retrieval_history = stage5_result["retrieval_history"]
 
         dependency_analysis_history.append({
-            "stage": "unified_subquery_generation",
-            "ranked_subproblem_groups": ranked_subproblem_groups,
+            "stage": "parent_answer_conditioned_rank_resolution",
+            "rank_groups": stage5_result["rank_groups"],
+            "processed_rank_groups": stage5_result["processed_rank_groups"],
+            "resolved_answers_by_node_id": stage5_result["resolved_answers_by_node_id"],
+            "final_subanswer_summary": stage5_result["final_subanswer_summary"],
+            "retrieval_history": retrieval_history,
         })
 
-        # rank-batch 단위의 Sampling without Replacement.
-        # 한 번 pop된 rank group은 다시 방문하지 않는다.
-        remaining_rank_groups = list(ranked_subproblem_groups)
-
-        # Dynamic adaptation을 위한 상태 변수
-        # sub_answers: 지금까지 풀린 sub의 답을 dag node id 기준으로 누적
-        #              (논문 line 12의 a_i를 누적)
-        # current_max_rank: 새 sub를 어디에 끼울지 결정할 때 사용
-        # adaptation_count: max_dynamic_adaptations 안전장치
-        sub_answers: Dict[int, str] = {}
-        if ranked_subproblem_groups:
-            current_max_rank = max(
-                g["rank"] for g in ranked_subproblem_groups
-            )
-        else:
-            current_max_rank = -1
-        adaptation_count = 0
-
-        # 논문 line 6: for each rank r in ascending topological order
-        # remaining_rank_groups가 비면 자연스럽게 종료.
-        # dynamic adaptation이 새 rank를 push하면 list가 다시 채워져 루프 연장.
-        while remaining_rank_groups and round_count < self.max_rounds:
-
-            rank_group = remaining_rank_groups.pop(0)
-            round_count += 1
-
-            rank = rank_group["rank"]
-            same_rank_subproblems = rank_group["subproblems"]
-
-            # 논문 line 7: Let S_r = {p_i | rank(p_i) = r}
-            # 논문 line 8: Construct unified query q_r = Merge(S_r) using LLM
-            unified_query = self.build_unified_query(
-                question=question,
-                rank=rank,
-                subproblems=same_rank_subproblems,
-            )
-
-            # 논문 line 9: Retrieve documents C_r = R(q_r; θ, K)
-            new_contexts = self._retrieve_for_query(
-                unified_query,
-                retrieved_chunks_set=retrieved_chunks_set,
-            )
-            last_contexts = new_contexts
-
-            # 논문 line 11–12: for each p_i ∈ S_r, resolve p_i → a_i
-            # decompose_unified_context_by_subproblem이 한 번의 LLM 호출로
-            # S_r 전체의 a_i를 동시에 도출한다 (논문의 inner for를 batch 처리).
-            decomposed_result = self.decompose_unified_context_by_subproblem(
-                question=question,
-                rank=rank,
-                subproblems=same_rank_subproblems,
-                unified_query=unified_query,
-                contexts=new_contexts,
-                current_summary=info_summary,
-            )
-
-            # 논문 line 10: Summarize C_r with respect to Q and Mem_{r-1} to get Mem_r
-            info_summary = self.refine_summary_with_unified_rank_result(
-                question=question,
-                rank=rank,
-                subproblems=same_rank_subproblems,
-                unified_query=unified_query,
-                contexts=new_contexts,
-                decomposed_result=decomposed_result,
-                current_summary=info_summary,
-            )
-
-            logger.info(f"Unified retrieval at round {round_count}, topological rank {rank}")
-            logger.info(f"same-rank subproblems: {same_rank_subproblems}")
-            logger.info(f"unified query: {unified_query}")
-
-            # sub_answers 누적 (논문 line 12의 a_i 저장에 해당)
-            for sub_ans in decomposed_result.get("subproblem_answers", []):
-                sub_text = sub_ans.get("subproblem", "")
-                answer_text = sub_ans.get("answer", "") or ""
-                if not isinstance(sub_text, str) or not isinstance(answer_text, str):
-                    continue
-                node_id = self._match_node_id_by_text(dag, sub_text)
-                if node_id is not None and answer_text.strip():
-                    sub_answers[node_id] = answer_text.strip()
-
-            retrieval_history.append({
-                "round": round_count,
-                "rank": rank,
-                "subproblems": same_rank_subproblems,
-                "unified_query": unified_query,
-                "contexts": new_contexts,
-                "decomposed_result": decomposed_result,
-            })
-
-            # ── 논문 line 14–17: Dynamic DAG Adaptation ──
-            # 매 rank 처리 직후 LLM에게 새 unresolved subproblem이 있는지 묻고,
-            # 있으면 DAG에 새 노드/엣지를 추가하여 다음 rank로 처리되도록 한다.
-            # 새 rank가 추가되면 remaining_rank_groups에 push되어
-            # 외곽 while 루프가 자연스럽게 한 번 더 돈다.
-            adaptation_event: Optional[Dict[str, Any]] = None
-            if adaptation_count < self.max_dynamic_adaptations:
-                new_sub_info = self._maybe_add_subproblem(
-                    question=question,
-                    info_summary=info_summary,
-                    dag=dag,
-                    sub_answers=sub_answers,
-                    current_max_rank=current_max_rank,
-                )
-
-                if new_sub_info is not None:
-                    new_id = new_sub_info["new_subproblem_id"]
-                    new_rank = new_sub_info["new_rank"]
-                    new_text = new_sub_info["new_subproblem_text"]
-
-                    remaining_rank_groups.append({
-                        "rank": new_rank,
-                        "subproblems": [new_text],
-                    })
-                    current_max_rank = max(current_max_rank, new_rank)
-                    adaptation_count += 1
-                    adaptation_event = new_sub_info
-
-            dependency_analysis_history.append({
-                "round": round_count,
-                "rank": rank,
-                "subproblems": same_rank_subproblems,
-                "unified_query": unified_query,
-                "decomposed_result": decomposed_result,
-                "adaptation": adaptation_event,
-            })
-
-            # 논문 line 6의 for 루프는 모든 rank를 끝까지 돌고,
-            # 중간에 종료하지 않는다. 따라서 can_answer 기반 즉시 종료 분기는 없다.
-
-        # ─── 논문 line 19: 모든 rank 처리 완료 → final answer = Compose({a_i}) ───
         logger.info(
-            f"Completed rank-level retrieval "
-            f"(rounds={round_count}/{self.max_rounds}, "
-            f"adaptations={adaptation_count}). Generating final answer..."
+            f"Parent-answer conditioned rank resolution completed: "
+            f"{round_count} rank rounds."
         )
+
         answer = self.generate_answer(question, info_summary)
         self.last_dependency_analysis = dependency_analysis_history
         self.last_retrieval_history = retrieval_history
+        return answer, last_contexts, round_count
+
+    def answer_question(self, question: str) -> Tuple[str, List[str], int]:
+        """
+        논문 baseline 실행 흐름 + Dynamic DAG Adaptation.
+
+        흐름:
+            Stage 1: query decomposition (논문 line 1)
+            Stage 2: DAG 구축 (논문 line 2-3)
+            Stage 3: DAG 검증 + cycle repair
+            Stage 4: topological rank 계산 (논문 line 4) + dag.ranks 동기화
+            Stage 5: ParentConditionedRankResolver.run() 호출
+                     - 매 rank 처리 (논문 line 6-13)
+                     - 매 rank 후 Dynamic DAG Adaptation (논문 line 14-17, 본인 담당)
+            Stage 6: Compose({a_i}) (논문 line 19)
+        """
+        round_count = 0
+        retrieval_history = []
+        last_contexts = []
+        dependency_analysis_history = []
+        retrieved_chunks_set = set() if self.filter_repeats else None
+
+        print(f"\n\n{Fore.CYAN}{self.MODEL_NAME} answering: {question}{Style.RESET_ALL}\n\n")
+
+        # ===============================================
+        # == Stage 1: query decomposition ==
+        # 논문 Algorithm 1 line 1: decompose Q into subproblems P
+        # ===============================================
+        decomposition = self.decompose_query(question)
+
+        logger.info(
+            f"Query decomposition result: "
+            f"{len(decomposition.get('subproblems', []))} subproblems detected."
+        )
+        logger.info(f"Subproblems: {decomposition.get('subproblems', [])}")
+
+        # ===============================================
+        # == Stage 2: Query Logic DAG construction ==
+        # 논문 Algorithm 1 line 2-3: Initialize DAG, populate edges
+        # ===============================================
+        dag = self.dag_builder.construct_from_subproblems(
+            question=question,
+            subproblems=decomposition["subproblems"],
+        )
+
+        self.last_query_logic_dag = dag
+        dag_dict = dag.to_dict()
+
+        dependency_analysis_history.append({
+            "stage": "query_logic_dag_construction",
+            "query_logic_dag": dag_dict,
+        })
+
+        logger.info(f"Constructed Query Logic DAG: {dag_dict}\n\n")
+
+        # ===============================================
+        # == Stage 3: DAG topological sort + cycle verification ==
+        # ===============================================
+        sorted_dependencies, verified_dag_dict, dag_verification_history = (
+            self._verify_sort_dependencies_with_repair(
+                question=question,
+                dag_dict=dag_dict,
+                max_repair_attempts=self.max_dag_repair_attempts,
+                on_repair_failure=self.dag_cycle_policy,
+            )
+        )
+
+        self.last_query_logic_dag_dict = verified_dag_dict
+
+        final_dag_result = dag_verification_history[-1]["dag_verification"]
+
+        if not final_dag_result.get("is_dag", False):
+            raise DependencyGraphCycleError(final_dag_result)
+
+        # ===============================================
+        # == Stage 4: topological rank calculation ==
+        # 논문 Algorithm 1 line 4: Topologically sort G to obtain ranks
+        # ===============================================
+        try:
+            topological_rank_result = compute_topological_ranks_from_verification(
+                final_dag_result
+            )
+
+            verified_dag_dict = attach_topological_ranks_to_dag_dict(
+                verified_dag_dict,
+                topological_rank_result,
+            )
+
+            # [추가] dag 객체 내부의 ranks dict도 함께 채워둔다.
+            # _maybe_add_subproblem이 dag.ranks.get()으로 부모 rank를 조회하므로 필요.
+            ranks_payload = topological_rank_result.get("ranks", {}) or {}
+            for raw_id, raw_rank in ranks_payload.items():
+                try:
+                    node_id = int(raw_id)
+                    rank_val = int(raw_rank)
+                except (TypeError, ValueError):
+                    continue
+                if node_id in dag.V:
+                    dag.ranks[node_id] = rank_val
+
+            logger.info(f"Topological rank result: {topological_rank_result}\n\n")
+
+        except TopologicalRankError as e:
+            logger.error(
+                f"{Fore.RED}Failed to compute topological ranks: {e}{Style.RESET_ALL}"
+            )
+            raise
+
+        self.last_query_logic_dag_dict = verified_dag_dict
+
+        dependency_analysis_history.append({
+            "stage": "dag_verification_and_topological_ranking",
+            "query_logic_dag": dag_dict,
+            "verified_query_logic_dag": verified_dag_dict,
+            "dag_verification_history": dag_verification_history,
+            "topological_rank": topological_rank_result,
+            "sorted_dependencies": sorted_dependencies,
+        })
+
+        logger.info(f"Verified Query Logic DAG: {verified_dag_dict}\n\n")
+        logger.info(f"Sorted dependencies: {sorted_dependencies}\n\n")
+
+        # ===============================================
+        # == Stage 5: parent-answer conditioned retrieval +
+        #             Dynamic DAG Adaptation ==
+        # 논문 Algorithm 1 line 6-17:
+        #   - line 6-13: rank 별 unified retrieval, sub 답 도출
+        #   - line 14-17: 매 rank 후 Dynamic DAG Adaptation (본인 담당)
+        #
+        # resolver에 dag, max_dynamic_adaptations를 함께 전달하여
+        # resolver의 매 rank 루프 안에서 _maybe_add_subproblem을 hook으로 호출하게 한다.
+        # ===============================================
+        rank_resolver = ParentConditionedRankResolver(self)
+
+        stage5_result = rank_resolver.run(
+            question=question,
+            dag_result=final_dag_result,
+            topological_rank_result=topological_rank_result,
+            sorted_dependencies=sorted_dependencies,
+            initial_memory="",
+            retrieved_chunks_set=retrieved_chunks_set,
+            max_rounds=None,
+            # [추가] Dynamic DAG Adaptation을 위한 인자
+            dag=dag,
+            max_dynamic_adaptations=self.max_dynamic_adaptations,
+        )
+
+        last_contexts = stage5_result["last_contexts"]
+        round_count = stage5_result["round_count"]
+        retrieval_history = stage5_result["retrieval_history"]
+        final_subanswer_summary = stage5_result["final_subanswer_summary"]
+
+        dependency_analysis_history.append({
+            "stage": "parent_answer_conditioned_rank_resolution_with_rolling_memory",
+            "rank_groups": stage5_result["rank_groups"],
+            "processed_rank_groups": stage5_result["processed_rank_groups"],
+            "resolved_answers_by_node_id": stage5_result["resolved_answers_by_node_id"],
+            "final_memory": stage5_result["final_memory"],
+            "final_subanswer_summary": final_subanswer_summary,
+            "retrieval_history": retrieval_history,
+            # [추가] Dynamic DAG Adaptation 발동 이력
+            "dynamic_adaptations": stage5_result.get("dynamic_adaptations", []),
+        })
+
+        logger.info(
+            f"Parent-answer conditioned rank resolution completed: "
+            f"{round_count} rank rounds, "
+            f"{len(stage5_result.get('dynamic_adaptations', []))} dynamic adaptations."
+        )
+
+        # ===============================================
+        # == Stage 6: final answer composition ==
+        # 논문 Algorithm 1 line 19: A = Compose({a_i})
+        # ===============================================
+        answer = self.compose_final_answer(
+            question=question,
+            subanswer_summary=final_subanswer_summary,
+        )
+
+        self.last_dependency_analysis = dependency_analysis_history
+        self.last_retrieval_history = retrieval_history
+
         return answer, last_contexts, round_count
