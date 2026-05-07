@@ -863,6 +863,54 @@ Output schema:
 
         return json.dumps(items, ensure_ascii=False, indent=2)
 
+    @staticmethod
+    def build_final_subanswer_summary_from_processed_groups(
+        processed_rank_groups: List[Dict[str, Any]],
+        resolved_answers_by_node_id: Dict[int, Dict[str, Any]],
+    ) -> str:
+        """
+        최종 answer composition에 넣을 node별 중간 답 요약을 만든다.
+
+        Dynamic DAG Adaptation으로 새로 append된 node는 초기 dag_result["sorted_node_ids"]에
+        존재하지 않는다. 따라서 최종 Compose 단계에서는 실제로 처리된 rank group 순서
+        (processed_rank_groups)를 기준으로 subanswer summary를 만들어야 한다.
+        """
+        ordered_node_ids: List[int] = []
+        seen_node_ids = set()
+
+        for group in processed_rank_groups or []:
+            for node in group.get("nodes", []) or []:
+                if not isinstance(node, dict):
+                    continue
+
+                node_id = _as_int(node.get("node_id"))
+                if node_id is None or node_id in seen_node_ids:
+                    continue
+
+                seen_node_ids.add(node_id)
+                ordered_node_ids.append(node_id)
+
+        if not ordered_node_ids:
+            ordered_node_ids = sorted(resolved_answers_by_node_id.keys())
+
+        items: List[Dict[str, Any]] = []
+
+        for node_id in ordered_node_ids:
+            answer_item = resolved_answers_by_node_id.get(node_id)
+            if not isinstance(answer_item, dict):
+                continue
+
+            items.append({
+                "node_id": node_id,
+                "subproblem": answer_item.get("subproblem", ""),
+                "answer": answer_item.get("answer", ""),
+                "is_answered": _as_bool(answer_item.get("is_answered", False)),
+                "evidence_summary": answer_item.get("evidence_summary", ""),
+                "missing_info": answer_item.get("missing_info", ""),
+            })
+
+        return json.dumps(items, ensure_ascii=False, indent=2)
+
     def run(
         self,
         question: str,
@@ -1052,6 +1100,16 @@ Output schema:
                     if answer_text:
                         sub_answers_for_hook[node_id] = answer_text
 
+                unresolved_answers_for_hook = [
+                    answer
+                    for answer in rank_result.get("node_answers", []) or []
+                    if isinstance(answer, dict)
+                    and (
+                        not _as_bool(answer.get("is_answered", False))
+                        or bool(_clean_text(answer.get("missing_info", "")))
+                    )
+                ]
+
                 try:
                     new_sub_info = self.rag._maybe_add_subproblem(
                         question=question,
@@ -1059,6 +1117,10 @@ Output schema:
                         dag=dag,
                         sub_answers=sub_answers_for_hook,
                         current_max_rank=current_max_rank,
+                        unresolved_answers=unresolved_answers_for_hook,
+                        current_rank=rank,
+                        current_nodes=nodes,
+                        rank_result=rank_result,
                     )
                 except Exception as e:
                     logger.error(
@@ -1096,8 +1158,8 @@ Output schema:
 
             idx += 1
 
-        final_subanswer_summary = self.build_final_subanswer_summary(
-            dag_result=dag_result,
+        final_subanswer_summary = self.build_final_subanswer_summary_from_processed_groups(
+            processed_rank_groups=rank_groups_to_process,
             resolved_answers_by_node_id=resolved_answers_by_node_id,
         )
 

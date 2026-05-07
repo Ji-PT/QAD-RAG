@@ -700,66 +700,104 @@ Return ONLY a JSON object with these keys:
         dag: QueryLogicDAG,
         sub_answers: Dict[int, str],
         current_max_rank: int,
+        unresolved_answers: Optional[List[Dict[str, Any]]] = None,
+        current_rank: Optional[int] = None,
+        current_nodes: Optional[List[Dict[str, Any]]] = None,
+        rank_result: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        논문 Algorithm 1 line 14–17 + Section 3.2 ❸ Dynamic Adaptation 구현.
+        논문 Algorithm 1 line 14–17 + Section 3.2 Dynamic DAG Adaptation 구현.
 
         ParentConditionedRankResolver.run()의 매 rank 처리 직후 hook으로 호출된다.
-        현재까지의 정보로 원 질문에 답할 수 있는지 LLM에게 판정 요청하고,
-        새 subproblem이 필요하면 DAG에 추가한다.
+        논문에서 Dynamic Adaptation은 현재 retrieval/resolution 과정에서 insufficient
+        context 또는 unresolved subproblem이 발견될 때 DAG를 동적으로 확장하는 단계다.
 
-        새 노드는 항상 max(기존 id) + 1 위치에 추가되고, edge는
-        기존 노드 → 새 노드 방향만 만들어지므로 cycle은 구조적으로 불가능.
-        따라서 verify_non_cyclicity 재호출은 필요 없다.
+        이 구현은 현재 rank의 unresolved answer(is_answered=False 또는 missing_info 존재)를
+        LLM에게 명시적으로 전달하여, 새 subproblem 추가 여부를 판단하게 한다.
 
-        Args:
-            question: 원래 질문 Q.
-            info_summary: 현재까지 누적된 rolling memory.
-            dag: QueryLogicDAG 객체. 내부 상태가 mutate된다.
-            sub_answers: 지금까지 풀린 sub의 답 모음 {node_id: answer_string}.
-            current_max_rank: 현재까지 사용된 최대 rank.
-
-        Returns:
-            None: 추가 sub 불필요 → 다음 rank로 자연스럽게 진행.
-            Dict: 새 sub가 추가됨. 다음 키들을 포함한다.
-                - "new_subproblem_id": int     - 새로 부여된 node id
-                - "new_subproblem_text": str   - 새 sub 문장
-                - "new_rank": int              - 새 sub의 rank
-                - "depends_on": List[int]      - 의존하는 기존 node id 목록
-                - "reason": str                - LLM이 제시한 추가 이유
+        새 노드는 max(기존 id) + 1 위치에 추가되고, edge는 기존 노드 -> 새 노드 방향만
+        만들어진다. 새 rank는 current rank sequence 뒤에 append되도록 current_max_rank + 1
+        이상으로 설정한다.
         """
+        unresolved_answers = unresolved_answers or []
+        current_nodes = current_nodes or []
+        rank_result = rank_result or {}
+
         # ── Step 1: LLM에게 보낼 요약 정보 구성 ──
         nodes_summary_lines = []
         for node_id in sorted(dag.V.keys()):
             node_text = dag.V[node_id].text
             answer = sub_answers.get(node_id, "(unresolved)")
             nodes_summary_lines.append(
-                f"- id={node_id}, text=\"{node_text}\", answer=\"{answer}\""
+                f'- id={node_id}, text="{node_text}", answer="{answer}"'
             )
         nodes_summary = "\n".join(nodes_summary_lines)
 
-        prompt = f"""You are deciding whether to extend a Query Logic Dependency Graph with ONE additional subproblem.
+        current_nodes_payload = []
+        for node in current_nodes:
+            if not isinstance(node, dict):
+                continue
+            current_nodes_payload.append({
+                "node_id": node.get("node_id"),
+                "subproblem": node.get("subproblem", ""),
+            })
 
-Original question:
+        unresolved_payload = []
+        for answer in unresolved_answers:
+            if not isinstance(answer, dict):
+                continue
+            unresolved_payload.append({
+                "node_id": answer.get("node_id"),
+                "subproblem": answer.get("subproblem", ""),
+                "answer": answer.get("answer", ""),
+                "is_answered": answer.get("is_answered", False),
+                "missing_info": answer.get("missing_info", ""),
+                "evidence_summary": answer.get("evidence_summary", ""),
+            })
+
+        rank_result_payload = json.dumps(rank_result, ensure_ascii=False, indent=2)
+
+        prompt = f"""You are performing Dynamic DAG Adaptation for LogicRAG.
+
+Original question Q:
 {question}
 
-Existing subproblems in the DAG (with their resolved answers, if any):
+Current topological rank just processed:
+{current_rank}
+
+Current rank subproblems:
+{json.dumps(current_nodes_payload, ensure_ascii=False, indent=2)}
+
+Existing subproblems in the DAG with their resolved answers, if any:
 {nodes_summary}
 
-Current rolling memory:
+Unresolved or insufficiently answered subproblems from the current rank:
+{json.dumps(unresolved_payload, ensure_ascii=False, indent=2)}
+
+Current rolling memory after resolving the current rank:
 {info_summary}
 
+Full current rank result:
+{rank_result_payload}
+
 Task:
-Decide whether ONE additional subproblem is needed to fully answer the original question.
+Decide whether ONE additional subproblem should be added to the Query Logic Dependency Graph.
+
+Paper-grounded trigger:
+- Add a new subproblem only when the current retrieval/resolution exposes insufficient context, an unresolved dependency, or a missing intermediate fact needed to resolve the original question.
+- Prefer using the unresolved/missing_info fields as the main evidence for adding a new subproblem.
 
 Rules:
-- If the question can already be answered with the existing subproblem answers and rolling memory, output {{"need_new_subproblem": false}} and set other fields to null/empty.
-- If a new subproblem is needed, output its text and the existing subproblem ids it depends on.
+- If there is no unresolved or missing intermediate information, output {{"need_new_subproblem": false}} unless the original question still clearly requires one missing intermediate subproblem.
+- If a new subproblem is needed, write a concrete, answerable retrieval subproblem.
 - The new subproblem MUST NOT duplicate any existing subproblem.
-- depends_on must reference existing subproblem ids only (or be an empty list if independent).
+- depends_on must reference existing subproblem ids only, or be an empty list if independent.
+- Use depends_on to point to the existing subproblem answers that the new subproblem logically depends on.
 - Add at most ONE subproblem per call.
+- Do not answer the new subproblem.
+- Return ONLY a JSON object.
 
-Output format (JSON ONLY, no other text):
+Output schema:
 {{
   "need_new_subproblem": boolean,
   "new_subproblem_text": string or null,
@@ -836,7 +874,9 @@ Output format (JSON ONLY, no other text):
                     metadata={
                         "source": "dynamic_adaptation",
                         "created_by": "maybe_add_subproblem",
+                        "added_after_rank": current_rank,
                         "added_at_round_max_rank": current_max_rank,
+                        "trigger_unresolved_answers": unresolved_payload,
                     },
                 )
             )
@@ -868,14 +908,15 @@ Output format (JSON ONLY, no other text):
                 )
 
         # ── Step 6: 새 노드의 rank 계산 ──
-        # 부모가 있으면 max(parent_rank) + 1, 없으면 current_max_rank + 1
-        # 논문 Algorithm 1 line 16: "Append p_{n+1} as a new rank after the current rank sequence"
+        # 논문 Algorithm 1 line 16: 새 subproblem을 current rank sequence 뒤에 append한다.
+        # 따라서 parent rank보다 뒤이면서도 현재 처리 sequence의 마지막 rank보다 뒤여야 한다.
         if depends_on:
-            parent_ranks = [dag.ranks.get(p, 0) for p in depends_on]
-            new_rank = max(parent_ranks) + 1
+            parent_ranks = [int(dag.ranks.get(p, 0)) for p in depends_on]
+            dependency_safe_rank = max(parent_ranks) + 1
         else:
-            new_rank = current_max_rank + 1
+            dependency_safe_rank = 0
 
+        new_rank = max(int(current_max_rank) + 1, dependency_safe_rank)
         dag.ranks[new_id] = new_rank
 
         logger.info(
@@ -890,6 +931,7 @@ Output format (JSON ONLY, no other text):
             "new_rank": new_rank,
             "depends_on": depends_on,
             "reason": reason,
+            "trigger_unresolved_answers": unresolved_payload,
         }
 
     @staticmethod
