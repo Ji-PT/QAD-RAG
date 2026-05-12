@@ -19,12 +19,17 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from src.utils.utils import get_response_with_retry, fix_json_response
 
 
 logger = logging.getLogger(__name__)
+
+# Notebook / experiment용 최소 진행 로그 전용 logger.
+# 기존 debug logger와 분리해서, Stage 5 rank loop 진행률만 출력한다.
+progress_logger = logging.getLogger("logicrag.progress")
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -970,6 +975,13 @@ Output schema:
             max_rounds = max(0, int(max_rounds))
             rank_groups_to_process = list(rank_groups[:max_rounds])
 
+        if progress_logger.isEnabledFor(logging.INFO):
+            progress_logger.info(
+                "[Stage 5/6] Rank groups prepared | rank_groups=%d | scheduled_rounds=%d",
+                len(rank_groups),
+                len(rank_groups_to_process),
+            )
+
         memory = initial_memory or ""
         resolved_answers_by_node_id: Dict[int, Dict[str, Any]] = {}
         retrieval_history: List[Dict[str, Any]] = []
@@ -993,6 +1005,17 @@ Output schema:
                 node.get("subproblem", "")
                 for node in nodes
             ]
+
+            round_start_time = time.perf_counter()
+
+            if progress_logger.isEnabledFor(logging.INFO):
+                progress_logger.info(
+                    "[Stage 5/6][Round %d/%d] START | rank=%s | nodes=%d",
+                    round_idx,
+                    len(rank_groups_to_process),
+                    rank,
+                    len(nodes),
+                )
 
             memory_before_rank = memory
 
@@ -1156,12 +1179,32 @@ Output schema:
                         "added_subproblem": new_sub_info,
                     })
 
+            if progress_logger.isEnabledFor(logging.INFO):
+                progress_logger.info(
+                    "[Stage 5/6][Round %d/%d] DONE | rank=%s | elapsed=%.2fs | contexts=%d | memory_chars=%d | dynamic_adaptations=%d",
+                    round_idx,
+                    len(rank_groups_to_process),
+                    rank,
+                    time.perf_counter() - round_start_time,
+                    len(contexts or []),
+                    len(memory or ""),
+                    adaptation_count,
+                )
+
             idx += 1
 
         final_subanswer_summary = self.build_final_subanswer_summary_from_processed_groups(
             processed_rank_groups=rank_groups_to_process,
             resolved_answers_by_node_id=resolved_answers_by_node_id,
         )
+
+        if progress_logger.isEnabledFor(logging.INFO):
+            progress_logger.info(
+                "[Stage 5/6] Resolver completed | rounds=%d | dynamic_adaptations=%d | final_memory_chars=%d",
+                len(retrieval_history),
+                len(dynamic_adaptations_log),
+                len(memory or ""),
+            )
 
         return {
             "rank_groups": rank_groups,
