@@ -1,6 +1,7 @@
 import copy
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.models.base_rag import BaseRAG
@@ -30,6 +31,10 @@ init()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Notebook / experiment용 최소 진행 로그 전용 logger.
+# 기존 src.models.logic_rag logger와 분리해서, 필요한 진행률 로그만 켤 수 있게 한다.
+progress_logger = logging.getLogger("logicrag.progress")
 
 
 # [추가] Few-shot 예시 상수 (논문 Section 3.2)
@@ -100,6 +105,34 @@ class LogicRAG(BaseRAG):
         # Dynamic DAG Adaptation cost cap.
         # 모든 rank는 처리하되, inference 중 새 subproblem 추가 횟수만 제한한다.
         self.max_dynamic_adaptations = 3
+
+    @staticmethod
+    def _format_elapsed(start_time: float) -> str:
+        return f"{time.perf_counter() - start_time:.2f}s"
+
+    def _log_progress(
+        self,
+        message: str,
+        start_time: Optional[float] = None,
+        **fields: Any,
+    ) -> None:
+        """
+        Notebook/experiment용 최소 진행 로그.
+
+        기존 상세 debug logger와 분리하기 위해 logicrag.progress logger만 사용한다.
+        """
+        if not progress_logger.isEnabledFor(logging.INFO):
+            return
+
+        parts = [message]
+
+        if start_time is not None:
+            parts.append(f"elapsed={self._format_elapsed(start_time)}")
+
+        for key, value in fields.items():
+            parts.append(f"{key}={value}")
+
+        progress_logger.info(" | ".join(parts))
 
     # ==================================================================
     # Query decomposition
@@ -978,16 +1011,36 @@ Output schema:
         Stage 5: parent-answer conditioned rank resolution + Dynamic DAG Adaptation
         Stage 6: final answer composition
         """
+        total_start_time = time.perf_counter()
+
         dependency_analysis_history = []
         retrieved_chunks_set = set() if self.filter_repeats else None
 
         print(f"\n\n{Fore.CYAN}{self.MODEL_NAME} answering: {question}{Style.RESET_ALL}\n\n")
 
+        self._log_progress(
+            "[START] LogicRAG answer_question",
+            question=str(question)[:120],
+            corpus_docs=len(self.corpus),
+            top_k=self.top_k,
+            filter_repeats=self.filter_repeats,
+        )
+
         # ===============================================
         # == Stage 1: query decomposition ==
         # 논문 Algorithm 1 line 1: decompose Q into subproblems P
         # ===============================================
+        stage_start_time = time.perf_counter()
+        self._log_progress("[Stage 1/6] Query decomposition START")
+
         decomposition = self.decompose_query(question)
+
+        self._log_progress(
+            "[Stage 1/6] Query decomposition DONE",
+            start_time=stage_start_time,
+            subproblems=len(decomposition.get("subproblems", []) or []),
+            is_simple=decomposition.get("is_simple"),
+        )
 
         logger.info(
             f"Query decomposition result: "
@@ -999,9 +1052,19 @@ Output schema:
         # == Stage 2: Query Logic DAG construction ==
         # 논문 Algorithm 1 line 2-3: Initialize DAG, populate edges
         # ===============================================
+        stage_start_time = time.perf_counter()
+        self._log_progress("[Stage 2/6] Query Logic DAG construction START")
+
         dag = self.dag_builder.construct_from_subproblems(
             question=question,
             subproblems=decomposition["subproblems"],
+        )
+
+        self._log_progress(
+            "[Stage 2/6] Query Logic DAG construction DONE",
+            start_time=stage_start_time,
+            nodes=len(dag.V),
+            edges=len(dag.E),
         )
 
         self.last_query_logic_dag = dag
@@ -1017,6 +1080,9 @@ Output schema:
         # ===============================================
         # == Stage 3: DAG topological sort + cycle verification ==
         # ===============================================
+        stage_start_time = time.perf_counter()
+        self._log_progress("[Stage 3/6] DAG verification / repair START")
+
         sorted_dependencies, verified_dag_dict, dag_verification_history = (
             self._verify_sort_dependencies_with_repair(
                 question=question,
@@ -1031,6 +1097,14 @@ Output schema:
 
         final_dag_result = dag_verification_history[-1]["dag_verification"]
 
+        self._log_progress(
+            "[Stage 3/6] DAG verification / repair DONE",
+            start_time=stage_start_time,
+            is_dag=final_dag_result.get("is_dag", False),
+            has_cycle=final_dag_result.get("has_cycle", False),
+            attempts=len(dag_verification_history),
+        )
+
         if not final_dag_result.get("is_dag", False):
             raise DependencyGraphCycleError(final_dag_result)
 
@@ -1038,6 +1112,9 @@ Output schema:
         # == Stage 4: topological rank calculation ==
         # 논문 Algorithm 1 line 4: Topologically sort G to obtain ranks
         # ===============================================
+        stage_start_time = time.perf_counter()
+        self._log_progress("[Stage 4/6] Topological rank calculation START")
+
         try:
             topological_rank_result = compute_topological_ranks_from_verification(
                 final_dag_result
@@ -1049,6 +1126,13 @@ Output schema:
             )
 
             logger.info(f"Topological rank result: {topological_rank_result}\n\n")
+
+            self._log_progress(
+                "[Stage 4/6] Topological rank calculation DONE",
+                start_time=stage_start_time,
+                max_rank=topological_rank_result.get("max_rank", 0),
+                rank_groups=len(topological_rank_result.get("rank_groups", {}) or {}),
+            )
 
         except TopologicalRankError as e:
             logger.error(
@@ -1089,6 +1173,12 @@ Output schema:
         # ===============================================
         rank_resolver = ParentConditionedRankResolver(self)
 
+        stage_start_time = time.perf_counter()
+        self._log_progress(
+            "[Stage 5/6] Parent-conditioned rank resolution START",
+            max_dynamic_adaptations=self.max_dynamic_adaptations,
+        )
+
         stage5_result = rank_resolver.run(
             question=question,
             dag_result=final_dag_result,
@@ -1105,6 +1195,13 @@ Output schema:
         round_count = stage5_result["round_count"]
         retrieval_history = stage5_result["retrieval_history"]
         final_subanswer_summary = stage5_result["final_subanswer_summary"]
+
+        self._log_progress(
+            "[Stage 5/6] Parent-conditioned rank resolution DONE",
+            start_time=stage_start_time,
+            rounds=round_count,
+            dynamic_adaptations=len(stage5_result.get("dynamic_adaptations", []) or []),
+        )
 
         self.last_query_logic_dag = runtime_dag
         self.last_query_logic_dag_final_dict = runtime_dag.to_dict()
@@ -1131,10 +1228,27 @@ Output schema:
         # == Stage 6: final answer composition ==
         # 논문 Algorithm 1 line 19: A = Compose({a_i})
         # ===============================================
+        stage_start_time = time.perf_counter()
+        self._log_progress("[Stage 6/6] Final answer composition START")
+
         answer = self.compose_final_answer(
             question=question,
             subanswer_summary=final_subanswer_summary,
         )
 
+        self._log_progress(
+            "[Stage 6/6] Final answer composition DONE",
+            start_time=stage_start_time,
+        )
+
+        self._log_progress(
+            "[DONE] LogicRAG answer_question",
+            start_time=total_start_time,
+            rounds=round_count,
+            dynamic_adaptations=len(stage5_result.get("dynamic_adaptations", []) or []),
+        )
+
         self.last_dependency_analysis = dependency_analysis_history
         self.last_retrieval_history = retrieval_history
+
+        return answer, last_contexts, round_count
