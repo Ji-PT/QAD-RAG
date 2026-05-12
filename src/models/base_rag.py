@@ -5,7 +5,7 @@ import pdb
 import pickle
 import torch
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 import numpy as np
@@ -130,14 +130,17 @@ class BaseRAG:
             logger.error(f"Error saving embeddings: {e}")
 
     def retrieve(self, query: str) -> List[str]:
-        """Retrieve similar sentences using query embedding."""
-        # Check cache first
-        if query in self.retrieval_cache:
-            return self.retrieval_cache[query]
-        # pdb.set_trace()
-
         if self.corpus_embeddings is None or not self.corpus:
             return []
+
+        effective_top_k = min(int(self.top_k), len(self.corpus))
+        if effective_top_k <= 0:
+            return []
+
+        # 기존에는 query만 cache key로 써서, top_k 검색에 오류 생김 -> cache key를 (query, effective_top_k)로 바꿈
+        cache_key = (query, effective_top_k)
+        if cache_key in self.retrieval_cache:
+            return self.retrieval_cache[cache_key]
 
         try:
             # Encode query
@@ -152,14 +155,14 @@ class BaseRAG:
             )
             
             # Convert indices to list before using them
-            top_k_scores, top_k_indices = similarities.topk(self.top_k)
+            top_k_scores, top_k_indices = similarities.topk(effective_top_k)
             indices = top_k_indices.tolist()
             
             # Get results using integer indices
             results = [self.corpus[idx] for idx in indices]
             
             # Cache results
-            self.retrieval_cache[query] = results
+            self.retrieval_cache[cache_key] = results
             return results
             
         except Exception as e:
