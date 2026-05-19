@@ -28,4 +28,4 @@ EMBEDDING_BATCH_SIZE = 32
 
 # Cache Configuration
 CACHE_DIR = "cache"
-RESULT_DIR = "result" 
+RESULT_DIR = "evaluation"
