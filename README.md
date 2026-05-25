@@ -1,86 +1,117 @@
-# LogicRAG: Structured RAG Guided by Query Logic Dependency Graph
+# LogicRAG — 연구용 정리본
 
-<div align="center">
-    <a href="http://makeapullrequest.com"><img src="https://img.shields.io/badge/PRs-welcome-green.svg"/></a>
-      <a href="http://makeapullrequest.com"><img src="https://img.shields.io/github/last-commit/chensyCN/Agentic-RAG?color=blue"/></a>
-      <a href="https://arxiv.org/abs/2508.06105"><img src="https://img.shields.io/badge/paper-available-brightgreen"/></a>
-</div>
+> 원본 레포지토리: [chensyCN/LogicRAG](https://github.com/chensyCN/Agentic-RAG) | 논문: [AAAI 2026](https://openreview.net/forum?id=ov1bwU35Mf) / [Arxiv](https://arxiv.org/abs/2508.06105)
 
-LogicRAG enables structured retrieval without building knowledge graphs on corpora. By constructing query logic dependency graphs to guide structured retrieval adaptively, it enables test-time scaling of graphRAG on large/dynamic knowledge bases. This work has been accepted to **AAAI**, with title [You Don't Need Pre-built Graphs for RAG: Retrieval Augmented Generation with Adaptive Reasoning Structures](https://openreview.net/forum?id=ov1bwU35Mf). An updated version also available on [Arxiv](https://arxiv.org/abs/2508.06105).
+## 개요
 
-![System Architecture](figs/framework.png)
+이 폴더는 **GraphRAG vs. LogicRAG 모델 비교 연구**를 위해 원본 LogicRAG 코드를 클론 후 실험에 맞게 구성한 것입니다.
 
-## 🌟 Key Features
+LogicRAG는 코퍼스에 지식 그래프를 사전 구축하지 않고, **질문 자체를 논리 의존 그래프(Query Logic DAG)로 분해**하여 단계적 검색을 수행하는 RAG 시스템입니다. GraphRAG가 인덱싱 단계에서 그래프를 만드는 것과 달리, LogicRAG는 추론 시점(test-time)에 동적으로 구조를 생성합니다.
 
-- **❶ Logic Dependency Analysis**: Convert complex questions into logical dependency graphs for planning multi-step retrieval.
-- **❷ Graph Reasoning Linearization**: Linearize complex graph reasoning into sequential subproblem solution while maintaining logic-coherence.
-- **❸ Efficiency**: Efficient scheduling via graph pruning, and context-length optimization via rolling memory.
-- **❹ Interpretable Results**: Provides clear reasoning paths and dependency analysis for better explainability.
+## 폴더 구조
 
-## 🚀 Quick Start
+```
+LogicRAG/
+├── .env                          # API 키 (gitignore 처리됨)
+├── config/config.py              # 모델·API·임베딩 설정
+├── run.py                        # 실행 진입점
+│
+├── src/
+│   ├── main.py                   # CLI 인자 파싱 및 평가 오케스트레이션
+│   ├── models/
+│   │   ├── base_rag.py           # 임베딩 기반 retrieval 공통 기반 클래스
+│   │   ├── logic_rag.py          # LogicRAG 메인 파이프라인 (6단계)
+│   │   ├── query_logic_dag.py    # Query Logic DAG 자료구조 및 빌더
+│   │   ├── verify_non_cyclicity.py  # DAG 사이클 검증 + 위상 정렬
+│   │   ├── dag_topological_rank.py  # 위상 rank 계산
+│   │   └── dag_rank_resolver.py  # rank 단위 retrieval + Dynamic Adaptation
+│   ├── evaluation/evaluation.py  # 평가 루프, 체크포인트, 메트릭 집계
+│   └── utils/utils.py            # OpenAI 호출, JSON 파싱, 정규화 유틸
+│
+├── dataset/                      # 벤치마크 데이터셋 (GraphRAG와 동일)
+│   ├── hotpotqa.json / hotpotqa_corpus.json
+│   ├── 2wikimultihopqa.json / 2wikimultihopqa_corpus.json
+│   └── musique.json / musique_corpus.json
+│
+├── cache/                        # 코퍼스 임베딩 캐시 (자동 생성)
+└── evaluation/                   # 평가 결과 및 체크포인트 (자동 생성)
+    ├── checkpoints/              # 5문항 간격 중간 저장
+    └── evaluation_results.json   # 최종 결과
+```
 
-### Installation and Configuration
+## 사전 준비
 
-- Install dependencies:
+루트 `.env` 파일에 API 키를 설정합니다.
+
+```
+OPENAI_API_KEY=your_api_key_here
+OPENAI_BASE_URL=https://...   # 커스텀 엔드포인트 사용 시
+```
+
+의존성 설치:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-- Set your OpenAI API key:
+모델·API 설정 변경은 `config/config.py`에서 합니다.
+
+| 설정 | 기본값 | 비고 |
+|------|--------|------|
+| `DEFAULT_MODEL` | `gpt-5.4-mini` | 사용하는 API 엔드포인트에 맞게 수정 |
+| `DEFAULT_MAX_TOKENS` | `250` | 응답이 잘리면 500~1000으로 조정 |
+| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | 로컬 HuggingFace 모델 |
+| `CALLS_PER_MINUTE` | `20` | API 속도 제한 |
+
+## 실험 실행 방법
+
+### 샘플 테스트 (5개)
 
 ```bash
-# Create a .env file in the root directory with:
-OPENAI_API_KEY=your_api_key_here
+python run.py --limit 5
 ```
 
-- Other configuration options can be modified in `config/config.py`
-
-### Running Evaluation on a Dataset
+### 데이터셋 지정 실행
 
 ```bash
-python run.py --model logic-rag --dataset path/to/dataset.json --corpus path/to/corpus.json --max-rounds 5 --top-k 3
+python run.py --dataset dataset/hotpotqa.json --corpus dataset/hotpotqa_corpus.json --limit 20
 ```
 
-Options:
+### 주요 옵션
 
-- `--max-rounds`: Maximum number of reasoning rounds (default: 3)
-- `--top-k`: Number of top contexts to retrieve (default: 5)
-- `--limit`: Number of questions to evaluate (default: 20)
-  - Set to `0` to process all questions in the dataset
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--dataset` | `dataset/hotpotqa.json` | 평가 데이터셋 경로 |
+| `--corpus` | `dataset/hotpotqa_corpus.json` | 검색 코퍼스 경로 |
+| `--limit` | `20` | 평가할 질문 수 (`0` = 전체) |
+| `--top-k` | `5` | 한 번에 검색할 context 수 |
+| `--checkpoint-interval` | `5` | 체크포인트 저장 간격 |
 
-### Running a Single Question
+### 단일 질문 테스트
 
 ```bash
-python run.py --model logic-rag --question "Your question here" --corpus path/to/corpus.json --max-rounds 5 --top-k 3
+python run.py --question "What is the capital of France?" --corpus dataset/hotpotqa_corpus.json
 ```
 
-### Example Usage
+## 파이프라인 개요
 
-```python
-from src.models.logic_rag import LogicRAG
+LogicRAG는 질문 하나에 대해 아래 6단계를 순차 실행합니다.
 
-# Initialize RAG system
-rag = LogicRAG('path/to/corpus.json')
-rag.set_max_rounds(5)
-rag.set_top_k(3)
+| 단계 | 설명 |
+|------|------|
+| Stage 1 | **Query Decomposition** — 질문을 서브문제로 분해 (few-shot prompting) |
+| Stage 2 | **DAG 구성** — 서브문제 간 논리 의존 관계를 그래프로 구성 |
+| Stage 3 | **사이클 검증 + repair** — DAG 무결성 확인, 사이클 발생 시 LLM으로 자동 수정 |
+| Stage 4 | **위상 정렬 + rank 계산** — 처리 순서를 rank 단위로 그룹화 |
+| Stage 5 | **Rank 단위 Retrieval + Dynamic Adaptation** — 부모 답변을 조건으로 검색, 필요 시 서브문제 동적 추가 |
+| Stage 6 | **최종 답 합성** — 모든 서브 답변을 종합해 최종 답 생성 |
 
-# Ask a question
-answer, contexts, rounds = rag.answer_question("What is the capital of France?")
-print(f"Answer: {answer}")
-print(f"Retrieved in {rounds} rounds")
-```
+## 데이터셋
 
-## 🍀 Citation
+| 데이터셋 | 질문 유형 | QA 수 | Corpus 수 |
+|---------|---------|------|---------|
+| HotpotQA | bridge / comparison (2-hop) | 1,000 | 9,811 |
+| 2WikiMultiHopQA | compositional / comparison 등 (2-hop) | 1,000 | 6,119 |
+| MuSiQue | 2~4-hop | 1,000 | 11,656 |
 
-If you find this work helpful, please cite our paper:
-
-```
-@inproceedings{logicrag,
-title={You Don't Need Pre-built Graphs for {RAG}: Retrieval Augmented Generation with Adaptive Reasoning Structures},
-author={Shengyuan Chen and Chuang Zhou and Zheng Yuan and Qinggang Zhang and Zeyang Cui and Hao Chen and Yilin
-Xiao and Jiannong Cao and Xiao Huang},
-booktitle={The Fortieth AAAI Conference on Artificial Intelligence},
-year={2026}
-}
-```
+비교 모델: [GraphRAG (Microsoft)](https://github.com/microsoft/graphrag)
