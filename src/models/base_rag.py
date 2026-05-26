@@ -29,6 +29,7 @@ class BaseRAG:
         os.makedirs(RESULT_DIR, exist_ok=True)
         
         self.model = SentenceTransformer(EMBEDDING_MODEL)
+        print(f"Embedding model device: {self.model.device}")
         self.corpus = {}
         self.corpus_embeddings = None
         self.embeddings = None  # For compatibility with vanilla_retrieve
