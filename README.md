@@ -17,7 +17,7 @@ LogicRAG/
 ├── run.py                        # 실행 진입점
 │
 ├── src/
-│   ├── main.py                   # CLI 인자 파싱 및 평가 오케스트레이션
+│   ├── main.py                   # 평가 오케스트레이션 (설정은 config.py에서)
 │   ├── models/
 │   │   ├── base_rag.py           # 임베딩 기반 retrieval 공통 기반 클래스
 │   │   ├── logic_rag.py          # LogicRAG 메인 파이프라인 (6단계)
@@ -28,10 +28,9 @@ LogicRAG/
 │   ├── evaluation/evaluation.py  # 평가 루프, 체크포인트, 메트릭 집계
 │   └── utils/utils.py            # OpenAI 호출, JSON 파싱, 정규화 유틸
 │
-├── dataset/                      # 벤치마크 데이터셋 (GraphRAG와 동일)
-│   ├── hotpotqa.json / hotpotqa_corpus.json
-│   ├── 2wikimultihopqa.json / 2wikimultihopqa_corpus.json
-│   └── musique.json / musique_corpus.json
+├── dataset/                      # 벤치마크 데이터셋
+│   ├── musique.json              # 평가 질문 (1,000개)
+│   └── musique_corpus.json       # 검색 코퍼스 (11,656개)
 │
 ├── cache/                        # 코퍼스 임베딩 캐시 (자동 생성)
 └── evaluation/                   # 평가 결과 및 체크포인트 (자동 생성)
@@ -58,39 +57,26 @@ pip install -r requirements.txt
 
 | 설정 | 기본값 | 비고 |
 |------|--------|------|
-| `DEFAULT_MODEL` | `gpt-5.4-mini` | 사용하는 API 엔드포인트에 맞게 수정 |
+| `DEFAULT_MODEL` | `gpt-4o-mini` | 사용하는 API 엔드포인트에 맞게 수정 |
 | `DEFAULT_MAX_TOKENS` | `250` | 응답이 잘리면 500~1000으로 조정 |
 | `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | 로컬 HuggingFace 모델 |
 | `CALLS_PER_MINUTE` | `20` | API 속도 제한 |
 
 ## 실험 실행 방법
 
-### 샘플 테스트 (5개)
+실험 세팅은 `config/config.py` 하단의 **Experiment Configuration** 섹션에서 변경합니다.
 
-```bash
-python run.py --limit 5
-```
-
-### 데이터셋 지정 실행
-
-```bash
-python run.py --dataset dataset/hotpotqa.json --corpus dataset/hotpotqa_corpus.json --limit 20
-```
-
-### 주요 옵션
-
-| 옵션 | 기본값 | 설명 |
+| 설정 | 기본값 | 설명 |
 |------|--------|------|
-| `--dataset` | `dataset/hotpotqa.json` | 평가 데이터셋 경로 |
-| `--corpus` | `dataset/hotpotqa_corpus.json` | 검색 코퍼스 경로 |
-| `--limit` | `20` | 평가할 질문 수 (`0` = 전체) |
-| `--top-k` | `5` | 한 번에 검색할 context 수 |
-| `--checkpoint-interval` | `5` | 체크포인트 저장 간격 |
+| `LIMIT` | `1000` | 평가할 질문 수 (`0` = 전체) |
+| `TOP_K` | `3` | 한 번에 검색할 context 수 (논문: k=3) |
+| `MAX_ROUNDS` | `5` | Dynamic DAG Adaptation 최대 횟수 (논문: 5) |
+| `CHECKPOINT_INTERVAL` | `5` | 체크포인트 저장 간격 |
 
-### 단일 질문 테스트
+설정 변경 후 실행:
 
 ```bash
-python run.py --question "What is the capital of France?" --corpus dataset/hotpotqa_corpus.json
+python run.py
 ```
 
 ## 파이프라인 개요
@@ -110,8 +96,6 @@ LogicRAG는 질문 하나에 대해 아래 6단계를 순차 실행합니다.
 
 | 데이터셋 | 질문 유형 | QA 수 | Corpus 수 |
 |---------|---------|------|---------|
-| HotpotQA | bridge / comparison (2-hop) | 1,000 | 9,811 |
-| 2WikiMultiHopQA | compositional / comparison 등 (2-hop) | 1,000 | 6,119 |
 | MuSiQue | 2~4-hop | 1,000 | 11,656 |
 
 비교 모델: [GraphRAG (Microsoft)](https://github.com/microsoft/graphrag)
