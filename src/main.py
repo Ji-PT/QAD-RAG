@@ -3,9 +3,6 @@ import json
 import logging
 from typing import Dict, List
 
-from src.evaluation.evaluation import RAGEvaluator
-from src.models.base_rag import BaseRAG
-from src.models.logic_rag import LogicRAG
 from config.config import (
     DATASET_PATH,
     CORPUS_PATH,
@@ -21,10 +18,6 @@ from config.config import (
 logging.basicConfig(level=logging.WARNING,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-RAG_MODELS = {
-    "logic-rag": LogicRAG,
-}
 
 
 def load_evaluation_data(dataset_path: str, limit: int) -> List[Dict]:
@@ -44,6 +37,8 @@ def main():
     if not eval_data:
         logger.error("No evaluation data available. Exiting.")
         return
+
+    from src.evaluation.evaluation import RAGEvaluator
 
     evaluator = RAGEvaluator(
         model_name="logic-rag",
