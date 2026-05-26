@@ -29,3 +29,27 @@ EMBEDDING_BATCH_SIZE = 32
 # Cache Configuration
 CACHE_DIR = "cache"
 RESULT_DIR = "evaluation"
+
+# ============================================================
+# Experiment Configuration — 실험 세팅을 여기서 변경하세요
+# ============================================================
+
+# 데이터셋 선택: "hotpotqa" | "2wikimultihopqa" | "musique"
+DATASET = "hotpotqa"
+
+DATASET_PATH  = f"dataset/{DATASET}.json"
+CORPUS_PATH   = f"dataset/{DATASET}_corpus.json"
+OUTPUT_FILE   = f"evaluation_results_{DATASET}.json"
+
+# 평가할 질문 수 (0 = 전체)
+LIMIT = 5
+
+# Retrieval 설정
+TOP_K = 5
+EVAL_TOP_KS = [5, 10]
+
+# Dynamic DAG Adaptation 최대 횟수
+MAX_ROUNDS = 3
+
+# 체크포인트 저장 간격 (질문 수)
+CHECKPOINT_INTERVAL = 5
