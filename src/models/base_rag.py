@@ -28,7 +28,14 @@ class BaseRAG:
         os.makedirs(cache_dir, exist_ok=True)
         os.makedirs(RESULT_DIR, exist_ok=True)
         
-        self.model = SentenceTransformer(EMBEDDING_MODEL)
+        if torch.cuda.is_available():
+            _device = "cuda"
+        elif torch.backends.mps.is_available():
+            _device = "mps"
+        else:
+            _device = "cpu"
+
+        self.model = SentenceTransformer(EMBEDDING_MODEL, device=_device)
         print(f"Embedding model device: {self.model.device}")
         self.corpus = {}
         self.corpus_embeddings = None
