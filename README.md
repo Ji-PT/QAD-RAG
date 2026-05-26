@@ -45,6 +45,7 @@ LogicRAG/
 ```
 OPENAI_API_KEY=your_api_key_here
 OPENAI_BASE_URL=https://...   # 커스텀 엔드포인트 사용 시
+HF_TOKEN=your_hf_token_here   # huggingface.co/settings/tokens (Read 권한)
 ```
 
 의존성 설치:

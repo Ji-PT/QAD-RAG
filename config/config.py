@@ -41,7 +41,7 @@ CORPUS_PATH   = f"dataset/{DATASET}_corpus.json"
 OUTPUT_FILE   = f"evaluation_results_{DATASET}.json"
 
 # 평가할 질문 수 (0 = 전체)
-LIMIT = 5  # 논문: validation set 1,000개
+LIMIT = 100  # 논문: validation set 1,000개
 
 # Retrieval 설정
 TOP_K = 3          # 논문: k=3
