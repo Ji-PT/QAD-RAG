@@ -213,20 +213,19 @@ def string_based_evaluation(generated: str, gold: str) -> dict:
     
     # Calculate accuracy
     accuracy = 1 if normalized_ground_truth in normalized_prediction else 0
-    
+
     # Calculate precision and recall
     prediction_tokens = normalized_prediction.split()
     ground_truth_tokens = normalized_ground_truth.split()
-    
-    # Handle yes/no/noanswer cases
-    if (normalized_prediction in ["yes", "no", "noanswer"] and 
-        normalized_prediction != normalized_ground_truth) or \
-       (normalized_ground_truth in ["yes", "no", "noanswer"] and 
-        normalized_prediction != normalized_ground_truth):
+
+    # Handle yes/no/noanswer cases: require exact match
+    if normalized_prediction in ["yes", "no", "noanswer"] or \
+       normalized_ground_truth in ["yes", "no", "noanswer"]:
+        exact = 1 if normalized_prediction == normalized_ground_truth else 0
         return {
-            "accuracy": accuracy,
-            "precision": 0,
-            "recall": 0
+            "accuracy": exact,
+            "precision": exact,
+            "recall": exact,
         }
     
     # Calculate token overlap

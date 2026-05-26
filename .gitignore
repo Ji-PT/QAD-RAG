@@ -1,6 +1,7 @@
 
 # Project-specific directory
 result/
+evaluation/
 
 # Environment variables
 .env
