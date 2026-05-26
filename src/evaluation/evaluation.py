@@ -6,16 +6,29 @@ from typing import Dict, List, Tuple, Any
 import json
 import os
 from tqdm import tqdm
+import wandb
 
 from src.utils.utils import (
-    normalize_answer, 
-    evaluate_with_llm, 
+    normalize_answer,
+    evaluate_with_llm,
     string_based_evaluation,
     save_results,
     TOKEN_COST
 )
 from src.models.logic_rag import LogicRAG
-from config.config import RESULT_DIR
+from config.config import (
+    RESULT_DIR,
+    DATASET,
+    LIMIT,
+    DEFAULT_MODEL,
+    EMBEDDING_MODEL,
+    WANDB_API_KEY,
+    _RUN_TIMESTAMP,
+)
+
+# gpt-4o-mini 기준 토큰당 비용 (USD)
+_PRICE_INPUT_PER_TOKEN  = 0.150 / 1_000_000
+_PRICE_OUTPUT_PER_TOKEN = 0.600 / 1_000_000
 
 # Configure logging
 logging.basicConfig(level=logging.WARNING)
@@ -51,7 +64,8 @@ class RAGEvaluator:
         self.top_k = top_k
         self.eval_top_ks = sorted(eval_top_ks)  # Sort to ensure consistent processing
         self.checkpoint_interval = checkpoint_interval
-        
+        self._wandb_enabled = False
+
         # Create result directory if it doesn't exist
         os.makedirs(RESULT_DIR, exist_ok=True)
         
@@ -78,7 +92,32 @@ class RAGEvaluator:
             self.model.set_max_rounds(self.max_rounds)
         
         logger.info(f"Initialized {self.model_name} model")
-    
+
+    def _init_wandb(self, output_file: str) -> None:
+        """wandb run을 초기화한다. WANDB_API_KEY가 없으면 비활성화."""
+        if not WANDB_API_KEY:
+            logger.warning("WANDB_API_KEY not set — wandb logging disabled.")
+            return
+        try:
+            run_name = os.path.splitext(os.path.basename(output_file))[0]
+            wandb.init(
+                project="LogicRAG",
+                name=run_name,
+                config={
+                    "dataset": DATASET,
+                    "limit": LIMIT,
+                    "top_k": self.top_k,
+                    "max_rounds": self.max_rounds,
+                    "model": DEFAULT_MODEL,
+                    "embedding_model": EMBEDDING_MODEL,
+                    "run_timestamp": _RUN_TIMESTAMP,
+                },
+            )
+            self._wandb_enabled = True
+            logger.info(f"wandb run initialized: {run_name}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize wandb: {e}")
+
     def evaluate_question(self, question: str, gold_answer: str) -> Dict:
         """Evaluate the model on a single question."""
         # Run the model on the question
@@ -196,6 +235,8 @@ class RAGEvaluator:
     
     def run_single_model_evaluation(self, eval_data: List[Dict], output_file: str = "evaluation_results.json"):
         """Run evaluation of a single model on the given evaluation data."""
+        self._init_wandb(output_file)
+
         # Try to load checkpoint
         results, metrics, processed_count = self._load_checkpoint(output_file)
         
@@ -225,9 +266,11 @@ class RAGEvaluator:
                 "total_time": 0,
                 "answer_coverage": 0,
                 "answer_accuracy": 0,
+                "exact_match": 0,
                 "string_accuracy": 0,
                 "string_precision": 0,
-                "string_recall": 0
+                "string_recall": 0,
+                "string_f1": 0,
             }
             
             # Add top-k hits for each k in eval_top_ks
@@ -237,6 +280,9 @@ class RAGEvaluator:
             # Add rounds tracking
             metrics["total_rounds"] = 0
         else:
+            # 이전 체크포인트에 없을 수 있는 신규 지표 보완
+            metrics.setdefault("exact_match", 0)
+            metrics.setdefault("string_f1", 0)
             logger.info(f"Restored token costs - Prompt: {TOKEN_COST['prompt']}, Completion: {TOKEN_COST['completion']}")
         
         # Evaluation metrics
@@ -247,12 +293,21 @@ class RAGEvaluator:
             question = item['question']
             gold_answer = item['answer']
 
+            # 질문 처리 전 토큰 스냅샷 (per-question delta 계산용)
+            prompt_before     = TOKEN_COST["prompt"]
+            completion_before = TOKEN_COST["completion"]
+
             # Evaluate the model on this question
             result = self.evaluate_question(
                 question=question,
                 gold_answer=gold_answer
             )
             results.append(result)
+
+            prompt_delta     = TOKEN_COST["prompt"]     - prompt_before
+            completion_delta = TOKEN_COST["completion"] - completion_before
+            cost_delta_usd   = (prompt_delta * _PRICE_INPUT_PER_TOKEN
+                                + completion_delta * _PRICE_OUTPUT_PER_TOKEN)
 
             # Update metrics
             metrics["total_time"] += result["time"]
@@ -263,14 +318,18 @@ class RAGEvaluator:
                 result["answer"],
                 gold_answer
             )
+            metrics["exact_match"] += string_metrics["exact_match"]
             metrics["string_accuracy"] += string_metrics["accuracy"]
             metrics["string_precision"] += string_metrics["precision"]
             metrics["string_recall"] += string_metrics["recall"]
+            metrics["string_f1"] += string_metrics["f1"]
 
             # Check retrieval coverage
+            answer_in_context = 0
             for j, ctx in enumerate(result["contexts"]):
                 if normalized_gold in normalize_answer(ctx):
                     metrics["answer_coverage"] += 1
+                    answer_in_context = 1
                     # Update counters for each k value
                     for k in self.eval_top_ks:
                         if j < k:
@@ -297,6 +356,23 @@ class RAGEvaluator:
                     f"avg_time={metrics['total_time'] / current_count:.1f}s/q"
                 )
 
+            # wandb per-question logging
+            if self._wandb_enabled:
+                wandb.log({
+                    "exact_match":          string_metrics["exact_match"],
+                    "f1":                   string_metrics["f1"],
+                    "llm_correct":          int(result["is_correct"]),
+                    "answer_in_context":    answer_in_context,
+                    "time_per_q":           result["time"],
+                    "rounds":               result.get("rounds", 0),
+                    "prompt_tokens":        prompt_delta,
+                    "completion_tokens":    completion_delta,
+                    "cost_usd":             cost_delta_usd,
+                    "running_exact_match":  metrics["exact_match"]  / current_count * 100,
+                    "running_f1":           metrics["string_f1"]    / current_count * 100,
+                    "running_llm_accuracy": metrics["answer_accuracy"] / current_count * 100,
+                }, step=current_count)
+
             # Save checkpoint at regular intervals
             if (current_count % self.checkpoint_interval == 0) or (i == len(eval_data) - 1):
                 self._save_checkpoint(results, metrics, current_count, output_file)
@@ -306,9 +382,11 @@ class RAGEvaluator:
             "avg_time": metrics["total_time"] / total_questions,
             "answer_coverage": metrics["answer_coverage"] / total_questions * 100,
             "answer_accuracy": metrics["answer_accuracy"] / total_questions * 100,
+            "exact_match": metrics["exact_match"] / total_questions * 100,
             "string_accuracy": metrics["string_accuracy"] / total_questions * 100,
             "string_precision": metrics["string_precision"] / total_questions * 100,
-            "string_recall": metrics["string_recall"] / total_questions * 100
+            "string_recall": metrics["string_recall"] / total_questions * 100,
+            "string_f1": metrics["string_f1"] / total_questions * 100,
         }
         
         # Add top-k coverage (renamed from accuracy) for each k in eval_top_ks
@@ -324,9 +402,11 @@ class RAGEvaluator:
                 "avg_time": avg_metrics["avg_time"]
             },
             "string_based": {
+                "exact_match": avg_metrics["exact_match"],
+                "f1": avg_metrics["string_f1"],
                 "accuracy": avg_metrics["string_accuracy"],
                 "precision": avg_metrics["string_precision"],
-                "recall": avg_metrics["string_recall"]
+                "recall": avg_metrics["string_recall"],
             },
             "llm_evaluated": {
                 "answer_accuracy": avg_metrics["answer_accuracy"]
@@ -369,6 +449,23 @@ class RAGEvaluator:
             output_file=output_file,
             results_dir=RESULT_DIR
         )
+
+        # wandb 최종 summary
+        if self._wandb_enabled:
+            total_cost_usd = (TOKEN_COST["prompt"]     * _PRICE_INPUT_PER_TOKEN
+                              + TOKEN_COST["completion"] * _PRICE_OUTPUT_PER_TOKEN)
+            wandb.summary.update({
+                "exact_match":           avg_metrics["exact_match"],
+                "f1":                    avg_metrics["string_f1"],
+                "llm_accuracy":          avg_metrics["answer_accuracy"],
+                "answer_coverage":       avg_metrics["answer_coverage"],
+                "avg_rounds":            avg_metrics["avg_rounds"],
+                "avg_time":              avg_metrics["avg_time"],
+                "total_prompt_tokens":   TOKEN_COST["prompt"],
+                "total_completion_tokens": TOKEN_COST["completion"],
+                "total_cost_usd":        total_cost_usd,
+            })
+            wandb.finish()
         
         # Log results in three sections
         logger.info(f"\nEvaluation Summary for {self.model_name}:")
@@ -384,7 +481,9 @@ class RAGEvaluator:
         
         # 1. String-based metrics
         logger.info("\n1. String-based Metrics:")
-        logger.info(f"  • Accuracy: {avg_metrics['string_accuracy']:.2f}%")
+        logger.info(f"  • Exact Match (EM): {avg_metrics['exact_match']:.2f}%")
+        logger.info(f"  • F1: {avg_metrics['string_f1']:.2f}%")
+        logger.info(f"  • Accuracy (contains): {avg_metrics['string_accuracy']:.2f}%")
         logger.info(f"  • Precision: {avg_metrics['string_precision']:.2f}%")
         logger.info(f"  • Recall: {avg_metrics['string_recall']:.2f}%")
         

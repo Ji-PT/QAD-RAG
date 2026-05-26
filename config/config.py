@@ -2,6 +2,7 @@
 Configuration file for API keys and other settings.
 """
 import os
+from datetime import datetime
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -11,6 +12,8 @@ load_dotenv()
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 # SMWU FACTCHAT API Configuration
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
+# Weights & Biases Configuration
+WANDB_API_KEY = os.getenv("WANDB_API_KEY")
 
 # API Rate Limiting Configuration
 CALLS_PER_MINUTE = 20
@@ -20,7 +23,7 @@ RETRY_DELAY = 120
 
 # Model Configuration
 DEFAULT_MODEL = "gpt-4o-mini"
-DEFAULT_MAX_TOKENS = 250
+DEFAULT_MAX_TOKENS = 500
 
 # Embedding Configuration
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -31,14 +34,15 @@ CACHE_DIR = "cache"
 RESULT_DIR = "evaluation"
 
 # ============================================================
-# Experiment Configuration — 실험 세팅을 여기서 변경하세요
+# Experiment Configuration
 # ============================================================
 
 DATASET = "musique"
 
 DATASET_PATH  = f"dataset/{DATASET}.json"
 CORPUS_PATH   = f"dataset/{DATASET}_corpus.json"
-OUTPUT_FILE   = f"evaluation_results_{DATASET}.json"
+_RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+OUTPUT_FILE   = f"evaluation_results_{DATASET}_{_RUN_TIMESTAMP}.json"
 
 # 평가할 질문 수 (0 = 전체)
 LIMIT = 100  # 논문: validation set 1,000개

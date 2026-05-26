@@ -35,7 +35,7 @@ LogicRAG/
 ├── cache/                        # 코퍼스 임베딩 캐시 (자동 생성)
 └── evaluation/                   # 평가 결과 및 체크포인트 (자동 생성)
     ├── checkpoints/              # 5문항 간격 중간 저장
-    └── evaluation_results_musique.json  # 최종 결과
+    └── evaluation_results_musique_YYYYMMDD_HHMMSS.json  # 최종 결과
 ```
 
 ## 사전 준비
@@ -46,6 +46,7 @@ LogicRAG/
 OPENAI_API_KEY=your_api_key_here
 OPENAI_BASE_URL=https://...   # 커스텀 엔드포인트 사용 시
 HF_TOKEN=your_hf_token_here   # huggingface.co/settings/tokens (Read 권한)
+WANDB_API_KEY=your_wandb_api_key_here
 ```
 
 의존성 설치:
@@ -59,8 +60,8 @@ pip install -r requirements.txt
 | 설정 | 기본값 | 비고 |
 |------|--------|------|
 | `DEFAULT_MODEL` | `gpt-4o-mini` | 사용하는 API 엔드포인트에 맞게 수정 |
-| `DEFAULT_MAX_TOKENS` | `250` | 응답이 잘리면 500~1000으로 조정 |
-| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | 로컬 HuggingFace 모델 |
+| `DEFAULT_MAX_TOKENS` | `500` | 응답 잘림 방지용 여유값 |
+| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | 로컬 HuggingFace 모델 (CUDA·MPS·CPU 자동 감지) |
 | `CALLS_PER_MINUTE` | `20` | API 속도 제한 |
 
 ## 실험 실행 방법
