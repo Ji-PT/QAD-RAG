@@ -242,30 +242,31 @@ class RAGEvaluator:
         # Evaluation metrics
         total_questions = len(eval_data) + processed_count
         
-        for i, item in enumerate(tqdm(eval_data, desc=f"Evaluating {self.model_name}")):
+        pbar = tqdm(eval_data, desc=f"Evaluating {self.model_name}", unit="q")
+        for i, item in enumerate(pbar):
             question = item['question']
             gold_answer = item['answer']
-            
+
             # Evaluate the model on this question
             result = self.evaluate_question(
                 question=question,
                 gold_answer=gold_answer
             )
             results.append(result)
-            
+
             # Update metrics
             metrics["total_time"] += result["time"]
             normalized_gold = normalize_answer(gold_answer)
-            
+
             # String-based evaluation
             string_metrics = string_based_evaluation(
-                result["answer"], 
+                result["answer"],
                 gold_answer
             )
             metrics["string_accuracy"] += string_metrics["accuracy"]
             metrics["string_precision"] += string_metrics["precision"]
             metrics["string_recall"] += string_metrics["recall"]
-            
+
             # Check retrieval coverage
             for j, ctx in enumerate(result["contexts"]):
                 if normalized_gold in normalize_answer(ctx):
@@ -275,17 +276,28 @@ class RAGEvaluator:
                         if j < k:
                             metrics[f"top{k}_hits"] += 1
                     break
-            
+
             # Update rounds
             if "rounds" in result:
                 metrics["total_rounds"] += result["rounds"]
-            
+
             # Evaluate answer using LLM
             if result["is_correct"]:
                 metrics["answer_accuracy"] += 1
-            
-            # Save checkpoint at regular intervals
+
+            # Progress log every 10 questions
             current_count = processed_count + i + 1
+            correct_so_far = metrics["answer_accuracy"]
+            acc_so_far = correct_so_far / current_count * 100
+            pbar.set_postfix(acc=f"{acc_so_far:.1f}%", t=f"{result['time']:.0f}s")
+            if current_count % 10 == 0 or i == len(eval_data) - 1:
+                tqdm.write(
+                    f"[Q {current_count:>4}/{total_questions}] "
+                    f"acc={acc_so_far:.1f}% ({int(correct_so_far)}/{current_count}) | "
+                    f"avg_time={metrics['total_time'] / current_count:.1f}s/q"
+                )
+
+            # Save checkpoint at regular intervals
             if (current_count % self.checkpoint_interval == 0) or (i == len(eval_data) - 1):
                 self._save_checkpoint(results, metrics, current_count, output_file)
         
