@@ -225,9 +225,11 @@ class RAGEvaluator:
                 "total_time": 0,
                 "answer_coverage": 0,
                 "answer_accuracy": 0,
+                "exact_match": 0,
                 "string_accuracy": 0,
                 "string_precision": 0,
-                "string_recall": 0
+                "string_recall": 0,
+                "string_f1": 0,
             }
             
             # Add top-k hits for each k in eval_top_ks
@@ -237,6 +239,9 @@ class RAGEvaluator:
             # Add rounds tracking
             metrics["total_rounds"] = 0
         else:
+            # 이전 체크포인트에 없을 수 있는 신규 지표 보완
+            metrics.setdefault("exact_match", 0)
+            metrics.setdefault("string_f1", 0)
             logger.info(f"Restored token costs - Prompt: {TOKEN_COST['prompt']}, Completion: {TOKEN_COST['completion']}")
         
         # Evaluation metrics
@@ -263,9 +268,11 @@ class RAGEvaluator:
                 result["answer"],
                 gold_answer
             )
+            metrics["exact_match"] += string_metrics["exact_match"]
             metrics["string_accuracy"] += string_metrics["accuracy"]
             metrics["string_precision"] += string_metrics["precision"]
             metrics["string_recall"] += string_metrics["recall"]
+            metrics["string_f1"] += string_metrics["f1"]
 
             # Check retrieval coverage
             for j, ctx in enumerate(result["contexts"]):
@@ -306,9 +313,11 @@ class RAGEvaluator:
             "avg_time": metrics["total_time"] / total_questions,
             "answer_coverage": metrics["answer_coverage"] / total_questions * 100,
             "answer_accuracy": metrics["answer_accuracy"] / total_questions * 100,
+            "exact_match": metrics["exact_match"] / total_questions * 100,
             "string_accuracy": metrics["string_accuracy"] / total_questions * 100,
             "string_precision": metrics["string_precision"] / total_questions * 100,
-            "string_recall": metrics["string_recall"] / total_questions * 100
+            "string_recall": metrics["string_recall"] / total_questions * 100,
+            "string_f1": metrics["string_f1"] / total_questions * 100,
         }
         
         # Add top-k coverage (renamed from accuracy) for each k in eval_top_ks
@@ -324,9 +333,11 @@ class RAGEvaluator:
                 "avg_time": avg_metrics["avg_time"]
             },
             "string_based": {
+                "exact_match": avg_metrics["exact_match"],
+                "f1": avg_metrics["string_f1"],
                 "accuracy": avg_metrics["string_accuracy"],
                 "precision": avg_metrics["string_precision"],
-                "recall": avg_metrics["string_recall"]
+                "recall": avg_metrics["string_recall"],
             },
             "llm_evaluated": {
                 "answer_accuracy": avg_metrics["answer_accuracy"]
@@ -384,7 +395,9 @@ class RAGEvaluator:
         
         # 1. String-based metrics
         logger.info("\n1. String-based Metrics:")
-        logger.info(f"  • Accuracy: {avg_metrics['string_accuracy']:.2f}%")
+        logger.info(f"  • Exact Match (EM): {avg_metrics['exact_match']:.2f}%")
+        logger.info(f"  • F1: {avg_metrics['string_f1']:.2f}%")
+        logger.info(f"  • Accuracy (contains): {avg_metrics['string_accuracy']:.2f}%")
         logger.info(f"  • Precision: {avg_metrics['string_precision']:.2f}%")
         logger.info(f"  • Recall: {avg_metrics['string_recall']:.2f}%")
         

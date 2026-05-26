@@ -211,7 +211,8 @@ def string_based_evaluation(generated: str, gold: str) -> dict:
     normalized_prediction = normalize_answer(generated)
     normalized_ground_truth = normalize_answer(gold)
     
-    # Calculate accuracy
+    exact_match = 1 if normalized_prediction == normalized_ground_truth else 0
+    # contains-based accuracy (lenient EM)
     accuracy = 1 if normalized_ground_truth in normalized_prediction else 0
 
     # Calculate precision and recall
@@ -223,21 +224,25 @@ def string_based_evaluation(generated: str, gold: str) -> dict:
        normalized_ground_truth in ["yes", "no", "noanswer"]:
         exact = 1 if normalized_prediction == normalized_ground_truth else 0
         return {
+            "exact_match": exact,
             "accuracy": exact,
             "precision": exact,
             "recall": exact,
+            "f1": float(exact),
         }
-    
+
     # Calculate token overlap
     common = Counter(prediction_tokens) & Counter(ground_truth_tokens)
     num_same = sum(common.values())
-    
-    # Calculate precision and recall
+
     precision = 1.0 * num_same / len(prediction_tokens) if prediction_tokens else 0
     recall = 1.0 * num_same / len(ground_truth_tokens) if ground_truth_tokens else 0
-    
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
     return {
+        "exact_match": exact_match,
         "accuracy": accuracy,
         "precision": precision,
-        "recall": recall
+        "recall": recall,
+        "f1": f1,
     } 

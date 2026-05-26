@@ -22,7 +22,7 @@ RETRY_DELAY = 120
 
 # Model Configuration
 DEFAULT_MODEL = "gpt-4o-mini"
-DEFAULT_MAX_TOKENS = 250
+DEFAULT_MAX_TOKENS = 500
 
 # Embedding Configuration
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
