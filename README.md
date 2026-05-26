@@ -35,7 +35,7 @@ LogicRAG/
 ├── cache/                        # 코퍼스 임베딩 캐시 (자동 생성)
 └── evaluation/                   # 평가 결과 및 체크포인트 (자동 생성)
     ├── checkpoints/              # 5문항 간격 중간 저장
-    └── evaluation_results.json   # 최종 결과
+    └── evaluation_results_musique.json  # 최종 결과
 ```
 
 ## 사전 준비
@@ -68,7 +68,7 @@ pip install -r requirements.txt
 
 | 설정 | 기본값 | 설명 |
 |------|--------|------|
-| `LIMIT` | `1000` | 평가할 질문 수 (`0` = 전체) |
+| `LIMIT` | `1000` | 평가할 질문 수 (`0` = 전체) — 전체 실행 전 `5`로 샘플 테스트 |
 | `TOP_K` | `3` | 한 번에 검색할 context 수 (논문: k=3) |
 | `MAX_ROUNDS` | `5` | Dynamic DAG Adaptation 최대 횟수 (논문: 5) |
 | `CHECKPOINT_INTERVAL` | `5` | 체크포인트 저장 간격 |
