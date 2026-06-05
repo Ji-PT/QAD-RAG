@@ -41,11 +41,11 @@ DATASET = "musique"
 
 DATASET_PATH  = f"dataset/{DATASET}.json"
 CORPUS_PATH   = f"dataset/{DATASET}_corpus.json"
-_RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+_RUN_TIMESTAMP = os.getenv("RUN_TIMESTAMP", datetime.now().strftime("%Y%m%d_%H%M%S"))
 OUTPUT_FILE   = f"evaluation_results_{DATASET}_{_RUN_TIMESTAMP}.json"
 
 # 평가할 질문 수 (0 = 전체)
-LIMIT = 100  # 논문: validation set 1,000개
+LIMIT = 1000  # 논문: validation set 1,000개
 
 # Retrieval 설정
 TOP_K = 3          # 논문: k=3
