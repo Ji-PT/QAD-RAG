@@ -113,6 +113,11 @@ class LogicRAG(BaseRAG):
         self.max_rounds: Optional[int] = 3
         self.enable_warm_up = True
         self.enable_early_stop = True
+        self.final_answer_policy = "structured"
+        self.last_final_answer_policy = ""
+        self.last_final_answer_source = ""
+        self.last_summary_completeness = ""
+        self.last_exit_type = ""
 
     @staticmethod
     def _format_elapsed(start_time: float) -> str:
@@ -154,6 +159,23 @@ class LogicRAG(BaseRAG):
             return
 
         self.max_rounds = max(0, int(max_rounds))
+
+    def set_enable_warm_up(self, value: bool) -> None:
+        """Enable or disable the question-level warm-up gate."""
+        self.enable_warm_up = self._coerce_bool(value)
+
+    def set_enable_early_stop(self, value: bool) -> None:
+        """Enable or disable the rank-level early-stop gate."""
+        self.enable_early_stop = self._coerce_bool(value)
+
+    def set_final_answer_policy(self, policy: str) -> None:
+        """Set the final answer routing policy."""
+        if policy not in {"generate", "structured"}:
+            raise ValueError(
+                f"Invalid final_answer_policy={policy!r}. "
+                "Expected 'generate' or 'structured'."
+            )
+        self.final_answer_policy = policy
 
     # ==================================================================
     # Query decomposition
@@ -247,6 +269,32 @@ Respond ONLY with the JSON object, no additional text."""
                 return False
 
         return bool(value)
+
+    @staticmethod
+    def _is_valid_final_subanswer_summary(summary: Any) -> bool:
+        """Return whether a final_subanswer_summary has usable content."""
+        if summary is None:
+            return False
+
+        if isinstance(summary, (list, dict)):
+            return bool(summary)
+
+        if isinstance(summary, str):
+            stripped = summary.strip()
+            if not stripped or stripped in {"[]", "{}"}:
+                return False
+
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                return True
+
+            if isinstance(parsed, (list, dict)):
+                return bool(parsed)
+
+            return parsed is not None
+
+        return True
 
     # ==================================================================
     # Dynamic DAG Adaptation helpers
@@ -1239,6 +1287,17 @@ Output schema:
         effective_enable_early_stop = (
             self.enable_early_stop if enable_early_stop is None else bool(enable_early_stop)
         )
+        effective_policy = self.final_answer_policy
+        if effective_policy not in {"generate", "structured"}:
+            raise ValueError(
+                f"Invalid final_answer_policy={effective_policy!r}. "
+                "Expected 'generate' or 'structured'."
+            )
+
+        self.last_final_answer_policy = effective_policy
+        self.last_final_answer_source = ""
+        self.last_summary_completeness = ""
+        self.last_exit_type = ""
 
         initial_memory = ""
         last_contexts: List[str] = []
@@ -1256,6 +1315,7 @@ Output schema:
             max_rounds=effective_max_rounds,
             warm_up=effective_enable_warm_up,
             early_stop=effective_enable_early_stop,
+            final_answer_policy=effective_policy,
         )
 
         # ===============================================
@@ -1313,6 +1373,9 @@ Output schema:
                     question=question,
                     info_summary=initial_memory,
                 )
+                self.last_final_answer_source = "warmup_generate"
+                self.last_summary_completeness = "none"
+                self.last_exit_type = "warmup_exit"
 
                 self._log_progress(
                     "[DONE] LogicRAG answer_question",
@@ -1542,25 +1605,132 @@ Output schema:
         stage_start_time = time.perf_counter()
         self._log_progress("[Stage 6/6] Final answer composition START")
 
-        if stage5_result.get("early_stopped", False):
-            answer = self.generate_answer(
-                question=question,
-                info_summary=stage5_result.get("final_memory", ""),
-            )
-        elif stage5_result.get("hit_max_rounds", False):
-            answer = self.generate_answer(
-                question=question,
-                info_summary=stage5_result.get("final_memory", ""),
-            )
+        final_memory = stage5_result.get("final_memory", "")
+        early_stopped = stage5_result.get("early_stopped", False)
+        hit_max_rounds = stage5_result.get("hit_max_rounds", False)
+        has_valid_summary = self._is_valid_final_subanswer_summary(final_subanswer_summary)
+
+        if effective_policy == "generate":
+            if early_stopped:
+                answer = self.generate_answer(
+                    question=question,
+                    info_summary=final_memory,
+                )
+                self.last_final_answer_source = "earlystop_generate"
+                self.last_summary_completeness = "none"
+                self.last_exit_type = "earlystop_exit"
+            elif hit_max_rounds:
+                answer = self.generate_answer(
+                    question=question,
+                    info_summary=final_memory,
+                )
+                self.last_final_answer_source = "maxround_generate"
+                self.last_summary_completeness = "none"
+                self.last_exit_type = "maxround_exit"
+            else:
+                answer = self.generate_answer(
+                    question=question,
+                    info_summary=final_memory,
+                )
+                self.last_final_answer_source = "normal_generate"
+                self.last_summary_completeness = "none"
+                self.last_exit_type = "normal_completion"
+        elif early_stopped:
+            early_stop_result = stage5_result.get("early_stop_result") or {}
+            judgement = early_stop_result.get("judgement") or {}
+            if not isinstance(judgement, dict):
+                judgement = {}
+            a15_final_answer = str(judgement.get("final_answer") or "").strip()
+
+            if a15_final_answer:
+                answer = a15_final_answer
+                self.last_final_answer_source = "earlystop_a15"
+                self.last_summary_completeness = "none"
+                self.last_exit_type = "earlystop_exit"
+            elif has_valid_summary:
+                answer = self.compose_final_answer(
+                    question=question,
+                    subanswer_summary=final_subanswer_summary,
+                )
+                if answer and str(answer).strip():
+                    self.last_final_answer_source = "earlystop_compose_fallback"
+                    self.last_summary_completeness = "partial"
+                    self.last_exit_type = "earlystop_exit"
+                else:
+                    answer = self.generate_answer(
+                        question=question,
+                        info_summary=final_memory,
+                    )
+                    self.last_final_answer_source = "earlystop_generate_fallback"
+                    self.last_summary_completeness = "none"
+                    self.last_exit_type = "earlystop_exit"
+            else:
+                answer = self.generate_answer(
+                    question=question,
+                    info_summary=final_memory,
+                )
+                self.last_final_answer_source = "earlystop_generate_fallback"
+                self.last_summary_completeness = "none"
+                self.last_exit_type = "earlystop_exit"
+        elif hit_max_rounds:
+            if has_valid_summary:
+                answer = self.compose_final_answer(
+                    question=question,
+                    subanswer_summary=final_subanswer_summary,
+                )
+                if answer and str(answer).strip():
+                    self.last_final_answer_source = "maxround_compose"
+                    self.last_summary_completeness = "partial"
+                    self.last_exit_type = "maxround_exit"
+                else:
+                    answer = self.generate_answer(
+                        question=question,
+                        info_summary=final_memory,
+                    )
+                    self.last_final_answer_source = "maxround_generate_fallback"
+                    self.last_summary_completeness = "none"
+                    self.last_exit_type = "maxround_exit"
+            else:
+                answer = self.generate_answer(
+                    question=question,
+                    info_summary=final_memory,
+                )
+                self.last_final_answer_source = "maxround_generate_fallback"
+                self.last_summary_completeness = "none"
+                self.last_exit_type = "maxround_exit"
         else:
-            answer = self.compose_final_answer(
-                question=question,
-                subanswer_summary=final_subanswer_summary,
-            )
+            if has_valid_summary:
+                answer = self.compose_final_answer(
+                    question=question,
+                    subanswer_summary=final_subanswer_summary,
+                )
+                if answer and str(answer).strip():
+                    self.last_final_answer_source = "normal_compose"
+                    self.last_summary_completeness = "complete"
+                    self.last_exit_type = "normal_completion"
+                else:
+                    answer = self.generate_answer(
+                        question=question,
+                        info_summary=final_memory,
+                    )
+                    self.last_final_answer_source = "normal_generate_fallback"
+                    self.last_summary_completeness = "none"
+                    self.last_exit_type = "normal_completion"
+            else:
+                answer = self.generate_answer(
+                    question=question,
+                    info_summary=final_memory,
+                )
+                self.last_final_answer_source = "normal_generate_fallback"
+                self.last_summary_completeness = "none"
+                self.last_exit_type = "normal_completion"
 
         self._log_progress(
             "[Stage 6/6] Final answer composition DONE",
             start_time=stage_start_time,
+            source=self.last_final_answer_source,
+            summary_completeness=self.last_summary_completeness,
+            exit_type=self.last_exit_type,
         )
 
         self._log_progress(
