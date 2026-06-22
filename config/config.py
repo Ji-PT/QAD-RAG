@@ -56,3 +56,8 @@ MAX_ROUNDS = 5     # 논문: max-rounds=5
 
 # 체크포인트 저장 간격 (질문 수)
 CHECKPOINT_INTERVAL = 5
+
+# ── 실험 제어 플래그 (CLI: --enable-warm-up / --enable-early-stop / --final-answer-policy) ──
+ENABLE_WARM_UP      = True          # warm-up gate 활성화 여부
+ENABLE_EARLY_STOP   = True          # early-stop gate 활성화 여부
+FINAL_ANSWER_POLICY = "structured"  # 최종 답 생성 정책: "generate" | "structured"

@@ -916,6 +916,106 @@ Output schema:
 
         return json.dumps(items, ensure_ascii=False, indent=2)
 
+    def judge_can_answer_now(
+        self,
+        question: str,
+        memory: str,
+        resolved_answers_by_node_id: Dict[int, Dict[str, Any]],
+        processed_rank_groups: List[Dict[str, Any]],
+        remaining_rank_groups: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Determine whether rank processing can stop now.
+
+        This is the rank-level counterpart of official LogicRAG's can_answer
+        gate. It deliberately uses only a boolean can_answer, not a confidence
+        label, so early stopping has a single auditable decision criterion.
+        """
+        resolved_payload = [
+            answer
+            for _, answer in sorted(
+                resolved_answers_by_node_id.items(),
+                key=lambda item: item[0],
+            )
+            if isinstance(answer, dict)
+        ]
+
+        remaining_payload = []
+        for group in remaining_rank_groups or []:
+            if not isinstance(group, dict):
+                continue
+
+            remaining_payload.append({
+                "rank": group.get("rank"),
+                "nodes": group.get("nodes", []),
+            })
+
+        prompt = f"""You are deciding whether LogicRAG can stop early.
+
+Original question:
+{question}
+
+Current rolling memory:
+{memory}
+
+Resolved subproblem answers so far:
+{json.dumps(resolved_payload, ensure_ascii=False, indent=2)}
+
+Processed rank groups:
+{json.dumps(processed_rank_groups, ensure_ascii=False, indent=2)}
+
+Remaining unprocessed rank groups:
+{json.dumps(remaining_payload, ensure_ascii=False, indent=2)}
+
+Task:
+Decide whether the original question can now be answered completely using ONLY the current rolling memory and resolved subproblem answers.
+
+Return can_answer=true ONLY if:
+- The final answer to the original question can be produced now.
+- No additional retrieval is needed.
+- No required factual dependency is missing.
+- Remaining unprocessed nodes are not needed to determine the final answer, or only require trivial composition already possible from resolved facts.
+
+If any remaining node may change or complete the final answer, return can_answer=false.
+
+Return ONLY a JSON object with this schema:
+{{
+  "can_answer": boolean,
+  "current_understanding": string,
+  "missing_info": string,
+  "blocking_remaining_node_ids": [list of integers],
+  "final_answer": string or null
+}}
+"""
+
+        try:
+            response = get_response_with_retry(prompt)
+            response = response.strip().replace("```json", "").replace("```", "")
+            parsed = fix_json_response(response)
+
+            if not isinstance(parsed, dict):
+                raise ValueError("early-stop judgement response is not a JSON object")
+
+            parsed["can_answer"] = _as_bool(parsed.get("can_answer", False))
+
+            if not isinstance(parsed.get("blocking_remaining_node_ids", []), list):
+                parsed["blocking_remaining_node_ids"] = []
+
+            parsed.setdefault("current_understanding", "")
+            parsed.setdefault("missing_info", "")
+            parsed.setdefault("final_answer", None)
+
+            return parsed
+
+        except Exception as e:
+            logger.error("Error in early-stop judgement: %s", e)
+            return {
+                "can_answer": False,
+                "current_understanding": "",
+                "missing_info": f"Early-stop judgement failed: {e}",
+                "blocking_remaining_node_ids": [],
+                "final_answer": None,
+            }
+
     def run(
         self,
         question: str,
@@ -930,6 +1030,7 @@ Output schema:
         # 기본값으로 호출하면 기존 동작 그대로 유지된다 (하위 호환성).
         dag: Optional[Any] = None,
         max_dynamic_adaptations: int = 0,
+        enable_early_stop: bool = False,
     ) -> Dict[str, Any]:
         """
         Parent-answer conditioned rank-level LogicRAG resolution.
@@ -950,6 +1051,7 @@ Output schema:
             max_rounds: rank 처리 최대 횟수. None이면 모든 rank 처리.
             dag: QueryLogicDAG 객체. dynamic adaptation 시 mutate된다.
             max_dynamic_adaptations: dynamic adaptation 최대 발동 횟수.
+            enable_early_stop: 각 rank 처리 후 can_answer 조기종료 gate를 켤지 여부.
 
         Returns:
             stage5 결과 dict. 다음 키 포함:
@@ -969,17 +1071,23 @@ Output schema:
             sorted_dependencies=sorted_dependencies,
         )
 
-        if max_rounds is None:
-            rank_groups_to_process = list(rank_groups)
-        else:
+        if max_rounds is not None:
             max_rounds = max(0, int(max_rounds))
-            rank_groups_to_process = list(rank_groups[:max_rounds])
+
+        rank_groups_to_process = list(rank_groups)
+        scheduled_rounds = (
+            len(rank_groups_to_process)
+            if max_rounds is None
+            else min(len(rank_groups_to_process), max_rounds)
+        )
 
         if progress_logger.isEnabledFor(logging.INFO):
             progress_logger.info(
-                "[Stage 5/6] Rank groups prepared | rank_groups=%d | scheduled_rounds=%d",
+                "[Stage 5/6] Rank groups prepared | rank_groups=%d | scheduled_rounds=%d | max_rounds=%s | early_stop=%s",
                 len(rank_groups),
-                len(rank_groups_to_process),
+                scheduled_rounds,
+                max_rounds,
+                enable_early_stop,
             )
 
         memory = initial_memory or ""
@@ -991,13 +1099,20 @@ Output schema:
         dynamic_adaptations_log: List[Dict[str, Any]] = []
         adaptation_count = 0
 
+        processed_rank_groups: List[Dict[str, Any]] = []
+        early_stopped = False
+        early_stop_result: Optional[Dict[str, Any]] = None
+
         # [변경] for-enumerate 대신 while-index 패턴.
         # rank_groups_to_process에 매 iteration 끝에 append할 수 있으므로
         # 명시적으로 list 길이를 매번 확인한다.
         idx = 0
-        while idx < len(rank_groups_to_process):
+        while (
+            idx < len(rank_groups_to_process)
+            and (max_rounds is None or len(retrieval_history) < max_rounds)
+        ):
             rank_group = rank_groups_to_process[idx]
-            round_idx = idx + 1
+            round_idx = len(retrieval_history) + 1
 
             rank = int(rank_group["rank"])
             nodes = rank_group.get("nodes", []) or []
@@ -1097,13 +1212,55 @@ Output schema:
                 "rank_result": rank_result,
             })
 
-            # ─── 8. [추가] Dynamic DAG Adaptation hook ───
+            processed_rank_groups.append(rank_group)
+
+            # ─── 8. [추가] can_answer 기반 early stopping hook ───
+            # 공식 LogicRAG의 per-round can_answer early return을
+            # DAG-rank 구조에서는 rank 처리 직후, dynamic adaptation 전에 수행한다.
+            if enable_early_stop:
+                remaining_rank_groups = rank_groups_to_process[idx + 1:]
+
+                early_judgement = self.judge_can_answer_now(
+                    question=question,
+                    memory=memory,
+                    resolved_answers_by_node_id=resolved_answers_by_node_id,
+                    processed_rank_groups=processed_rank_groups,
+                    remaining_rank_groups=remaining_rank_groups,
+                )
+
+                retrieval_history[-1]["early_stop_judgement"] = early_judgement
+
+                if _as_bool(early_judgement.get("can_answer", False)):
+                    early_stopped = True
+                    early_stop_result = {
+                        "round": round_idx,
+                        "rank": rank,
+                        "judgement": early_judgement,
+                    }
+
+                    if progress_logger.isEnabledFor(logging.INFO):
+                        progress_logger.info(
+                            "[Stage 5/6][Round %d] EARLY STOP | rank=%s",
+                            round_idx,
+                            rank,
+                        )
+
+                    idx += 1
+                    break
+
+            # ─── 9. [추가] Dynamic DAG Adaptation hook ───
             # 논문 Algorithm 1 line 14-17 구현.
             # dag와 max_dynamic_adaptations가 함께 제공된 경우에만 작동.
             # LogicRAG._maybe_add_subproblem()을 호출하여 새 sub 필요 여부 판정.
             # 새 sub가 추가되면 rank_groups_to_process에 append하여 다음 iteration에서 처리됨.
+            has_round_budget_after_this = (
+                max_rounds is None
+                or len(retrieval_history) < max_rounds
+            )
+
             if (
-                dag is not None
+                has_round_budget_after_this
+                and dag is not None
                 and max_dynamic_adaptations > 0
                 and adaptation_count < max_dynamic_adaptations
             ):
@@ -1194,8 +1351,16 @@ Output schema:
             idx += 1
 
         final_subanswer_summary = self.build_final_subanswer_summary_from_processed_groups(
-            processed_rank_groups=rank_groups_to_process,
+            processed_rank_groups=processed_rank_groups,
             resolved_answers_by_node_id=resolved_answers_by_node_id,
+        )
+
+        unprocessed_rank_groups = rank_groups_to_process[idx:]
+        hit_max_rounds = (
+            max_rounds is not None
+            and len(retrieval_history) >= max_rounds
+            and bool(unprocessed_rank_groups)
+            and not early_stopped
         )
 
         if progress_logger.isEnabledFor(logging.INFO):
@@ -1208,7 +1373,8 @@ Output schema:
 
         return {
             "rank_groups": rank_groups,
-            "processed_rank_groups": rank_groups_to_process,
+            "processed_rank_groups": processed_rank_groups,
+            "unprocessed_rank_groups": unprocessed_rank_groups,
             "resolved_answers_by_node_id": resolved_answers_by_node_id,
             "retrieval_history": retrieval_history,
             "last_contexts": last_contexts,
@@ -1217,4 +1383,8 @@ Output schema:
             "final_subanswer_summary": final_subanswer_summary,
             # [추가] Dynamic DAG Adaptation 발동 이력
             "dynamic_adaptations": dynamic_adaptations_log,
+            "early_stopped": early_stopped,
+            "early_stop_result": early_stop_result,
+            "hit_max_rounds": hit_max_rounds,
+            "max_rounds": max_rounds,
         }

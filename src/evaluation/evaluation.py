@@ -47,7 +47,10 @@ class RAGEvaluator:
     """Evaluator for RAG models."""
     
     def __init__(self, model_name: str, corpus_path: str, max_rounds: int = 3, top_k: int = 5, 
-                eval_top_ks: List[int] = [5, 10], checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL):
+                eval_top_ks: List[int] = [5, 10], checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
+                enable_warm_up: bool = True, enable_early_stop: bool = True,
+                final_answer_policy: str = "structured", limit: int = LIMIT,
+                run_name: str = ""):
         """Initialize the evaluator with corpus path and parameters.
         
         Args:
@@ -64,6 +67,11 @@ class RAGEvaluator:
         self.top_k = top_k
         self.eval_top_ks = sorted(eval_top_ks)  # Sort to ensure consistent processing
         self.checkpoint_interval = checkpoint_interval
+        self.enable_warm_up = enable_warm_up
+        self.enable_early_stop = enable_early_stop
+        self.final_answer_policy = final_answer_policy
+        self.limit = limit
+        self.run_name = run_name
         self._wandb_enabled = False
 
         # Create result directory if it doesn't exist
@@ -90,6 +98,12 @@ class RAGEvaluator:
         # Set max rounds for agentic models
         if hasattr(self.model, 'set_max_rounds'):
             self.model.set_max_rounds(self.max_rounds)
+        if hasattr(self.model, 'set_enable_warm_up'):
+            self.model.set_enable_warm_up(self.enable_warm_up)
+        if hasattr(self.model, 'set_enable_early_stop'):
+            self.model.set_enable_early_stop(self.enable_early_stop)
+        if hasattr(self.model, 'set_final_answer_policy'):
+            self.model.set_final_answer_policy(self.final_answer_policy)
         
         logger.info(f"Initialized {self.model_name} model")
 
@@ -105,9 +119,13 @@ class RAGEvaluator:
                 name=run_name,
                 config={
                     "dataset": DATASET,
-                    "limit": LIMIT,
+                    "limit": self.limit,
                     "top_k": self.top_k,
                     "max_rounds": self.max_rounds,
+                    "enable_warm_up": self.enable_warm_up,
+                    "enable_early_stop": self.enable_early_stop,
+                    "final_answer_policy": self.final_answer_policy,
+                    "run_name": self.run_name,
                     "model": DEFAULT_MODEL,
                     "embedding_model": EMBEDDING_MODEL,
                     "run_timestamp": _RUN_TIMESTAMP,
@@ -136,7 +154,11 @@ class RAGEvaluator:
             "contexts": contexts,
             "time": elapsed_time,
             "rounds": rounds,
-            "is_correct": is_correct
+            "is_correct": is_correct,
+            "final_answer_policy": getattr(self.model, "last_final_answer_policy", ""),
+            "final_answer_source": getattr(self.model, "last_final_answer_source", ""),
+            "summary_completeness": getattr(self.model, "last_summary_completeness", ""),
+            "exit_type": getattr(self.model, "last_exit_type", ""),
         }
         
         # Add dependency analysis for interpretable models

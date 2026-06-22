@@ -106,6 +106,19 @@ class LogicRAG(BaseRAG):
         # 모든 rank는 처리하되, inference 중 새 subproblem 추가 횟수만 제한한다.
         self.max_dynamic_adaptations = 3
 
+        # Official LogicRAG-style inference controls.
+        # - max_rounds=3 matches the common experimental budget.
+        # - warm-up runs a question-level retrieval gate before DAG construction.
+        # - early stop runs a can_answer gate after each processed rank.
+        self.max_rounds: Optional[int] = 3
+        self.enable_warm_up = True
+        self.enable_early_stop = True
+        self.final_answer_policy = "structured"
+        self.last_final_answer_policy = ""
+        self.last_final_answer_source = ""
+        self.last_summary_completeness = ""
+        self.last_exit_type = ""
+
     @staticmethod
     def _format_elapsed(start_time: float) -> str:
         return f"{time.perf_counter() - start_time:.2f}s"
@@ -133,6 +146,36 @@ class LogicRAG(BaseRAG):
             parts.append(f"{key}={value}")
 
         progress_logger.info(" | ".join(parts))
+
+    def set_max_rounds(self, max_rounds: Optional[int]) -> None:
+        """Set the maximum number of Stage 5 rank-retrieval rounds.
+
+        None means no explicit round budget. Non-negative integers cap the
+        total number of executed rank rounds, including dynamically appended
+        ranks.
+        """
+        if max_rounds is None:
+            self.max_rounds = None
+            return
+
+        self.max_rounds = max(0, int(max_rounds))
+
+    def set_enable_warm_up(self, value: bool) -> None:
+        """Enable or disable the question-level warm-up gate."""
+        self.enable_warm_up = self._coerce_bool(value)
+
+    def set_enable_early_stop(self, value: bool) -> None:
+        """Enable or disable the rank-level early-stop gate."""
+        self.enable_early_stop = self._coerce_bool(value)
+
+    def set_final_answer_policy(self, policy: str) -> None:
+        """Set the final answer routing policy."""
+        if policy not in {"generate", "structured"}:
+            raise ValueError(
+                f"Invalid final_answer_policy={policy!r}. "
+                "Expected 'generate' or 'structured'."
+            )
+        self.final_answer_policy = policy
 
     # ==================================================================
     # Query decomposition
@@ -226,6 +269,32 @@ Respond ONLY with the JSON object, no additional text."""
                 return False
 
         return bool(value)
+
+    @staticmethod
+    def _is_valid_final_subanswer_summary(summary: Any) -> bool:
+        """Return whether a final_subanswer_summary has usable content."""
+        if summary is None:
+            return False
+
+        if isinstance(summary, (list, dict)):
+            return bool(summary)
+
+        if isinstance(summary, str):
+            stripped = summary.strip()
+            if not stripped or stripped in {"[]", "{}"}:
+                return False
+
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                return True
+
+            if isinstance(parsed, (list, dict)):
+                return bool(parsed)
+
+            return parsed is not None
+
+        return True
 
     # ==================================================================
     # Dynamic DAG Adaptation helpers
@@ -547,6 +616,194 @@ Output schema:
             return self.retrieve(query)
         finally:
             self.top_k = old_top_k
+
+    # ==================================================================
+    # Warm-up / answerability helpers
+    # ==================================================================
+
+    def refine_summary_with_context(
+        self,
+        question: str,
+        new_contexts: List[str],
+        current_summary: str = "",
+    ) -> str:
+        """Summarize retrieved contexts into the rolling information summary.
+
+        This is used by the official LogicRAG-style warm-up gate. The summary
+        is also passed as Stage 5 initial_memory when warm-up cannot answer.
+        """
+        context_text = "\n\n".join(new_contexts or []).strip()
+        current_summary = (current_summary or "").strip()
+
+        if not context_text and not current_summary:
+            return ""
+
+        try:
+            if current_summary:
+                prompt = f"""Please refine the current information summary using newly retrieved information.
+
+Question:
+{question}
+
+Current summary:
+{current_summary}
+
+New retrieved information:
+{context_text}
+
+Rules:
+- Integrate only facts that may help answer the question.
+- Remove redundancy and irrelevant details.
+- Preserve exact names, dates, numbers, relations, and comparison targets.
+- Do not invent unsupported facts.
+
+Refined summary:
+"""
+            else:
+                prompt = f"""Please create a concise information summary from the retrieved documents.
+
+Question:
+{question}
+
+Retrieved information:
+{context_text}
+
+Rules:
+- Include only facts that may help answer the question.
+- Exclude irrelevant details.
+- Preserve exact names, dates, numbers, relations, and comparison targets.
+- Do not invent unsupported facts.
+
+Summary:
+"""
+
+            return get_response_with_retry(prompt).strip()
+
+        except Exception as e:
+            logger.error(f"{Fore.RED}Error refining summary with context: {e}{Style.RESET_ALL}")
+            if current_summary and context_text:
+                return f"{current_summary}\n\nNew retrieved information:\n{context_text}".strip()
+            return current_summary or context_text
+
+    def warm_up_analysis(self, question: str, info_summary: str) -> Dict[str, Any]:
+        """Question-level answerability gate before DAG construction.
+
+        can_answer=True means the system can return immediately using only the
+        warm-up information summary. Parse failures deliberately fall back to
+        can_answer=False to avoid unsafe premature exits.
+        """
+        info_summary = (info_summary or "").strip()
+
+        if not info_summary:
+            return {
+                "can_answer": False,
+                "missing_info": "No warm-up information was retrieved.",
+                "subquery": question,
+                "current_understanding": "",
+                "dependencies": [],
+                "missing_reason": "empty_warm_up_summary",
+            }
+
+        try:
+            prompt = f"""You are performing warm-up analysis before LogicRAG DAG reasoning.
+
+Original question:
+{question}
+
+Available information summary:
+{info_summary}
+
+Task:
+Decide whether the original question can be answered completely using ONLY the available information summary.
+
+Return can_answer=true ONLY if:
+- The final answer to the original question is directly supported by the summary, or
+- The final answer can be produced by simple comparison/composition of facts already present in the summary.
+- No required fact is missing.
+- No additional retrieval is needed.
+
+If any required fact is missing, ambiguous, conflicting, or not directly supported, return can_answer=false.
+
+Also provide dependencies: the key information needs that deeper DAG reasoning should resolve if can_answer is false.
+
+Return ONLY a JSON object with this schema:
+{{
+  "can_answer": boolean,
+  "missing_info": string,
+  "subquery": string,
+  "current_understanding": string,
+  "dependencies": [list of strings],
+  "missing_reason": string
+}}
+"""
+
+            response = get_response_with_retry(prompt)
+            response = response.strip().replace("```json", "").replace("```", "")
+            result = fix_json_response(response)
+
+            if not isinstance(result, dict):
+                raise ValueError("warm-up response is not a JSON object")
+
+            result["can_answer"] = self._coerce_bool(result.get("can_answer", False))
+
+            dependencies = result.get("dependencies", [])
+            if not isinstance(dependencies, list):
+                dependencies = []
+
+            result["dependencies"] = [
+                str(dep).strip()
+                for dep in dependencies
+                if str(dep).strip()
+            ]
+            result.setdefault("missing_info", "")
+            result.setdefault("subquery", question)
+            result.setdefault("current_understanding", "")
+            result.setdefault("missing_reason", "")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"{Fore.RED}Error in warm_up_analysis: {e}{Style.RESET_ALL}")
+            return {
+                "can_answer": False,
+                "missing_info": f"Warm-up analysis failed: {e}",
+                "subquery": question,
+                "current_understanding": "",
+                "dependencies": [],
+                "missing_reason": "warm_up_analysis_error",
+            }
+
+    def generate_answer(self, question: str, info_summary: str) -> str:
+        """Generate a direct final answer from the current information summary.
+
+        Used for warm-up early return, rank-level early stop, and max_rounds
+        budget exhaustion.
+        """
+        try:
+            prompt = f"""You must give ONLY the direct final answer in the most concise way possible.
+
+Question:
+{question}
+
+Information summary:
+{info_summary}
+
+Rules:
+- Use ONLY the information summary.
+- Do not explain.
+- Do not include reasoning steps.
+- Do not include citations.
+- If the answer is yes/no, answer only "Yes." or "No."
+- If the answer is a name, date, number, or short phrase, return only that value.
+- Do not invent unsupported facts.
+
+Final answer:
+"""
+            return get_response_with_retry(prompt).strip()
+
+        except Exception as e:
+            logger.error(f"{Fore.RED}Error generating answer: {e}{Style.RESET_ALL}")
+            return ""
 
     # ==================================================================
     # Final composition
@@ -1000,10 +1257,17 @@ Output schema:
     # Main entrypoint
     # ==================================================================
 
-    def answer_question(self, question: str) -> Tuple[str, List[str], int]:
+    def answer_question(
+        self,
+        question: str,
+        max_rounds: Optional[int] = None,
+        enable_warm_up: Optional[bool] = None,
+        enable_early_stop: Optional[bool] = None,
+    ) -> Tuple[str, List[str], int]:
         """
         LogicRAG main pipeline with Dynamic DAG Adaptation.
 
+        Stage 0: official LogicRAG-style warm-up retrieval gate
         Stage 1: query decomposition
         Stage 2: Query Logic DAG construction
         Stage 3: DAG verification + cycle repair
@@ -1016,6 +1280,30 @@ Output schema:
         dependency_analysis_history = []
         retrieved_chunks_set = set() if self.filter_repeats else None
 
+        effective_max_rounds = self.max_rounds if max_rounds is None else max(0, int(max_rounds))
+        effective_enable_warm_up = (
+            self.enable_warm_up if enable_warm_up is None else bool(enable_warm_up)
+        )
+        effective_enable_early_stop = (
+            self.enable_early_stop if enable_early_stop is None else bool(enable_early_stop)
+        )
+        effective_policy = self.final_answer_policy
+        if effective_policy not in {"generate", "structured"}:
+            raise ValueError(
+                f"Invalid final_answer_policy={effective_policy!r}. "
+                "Expected 'generate' or 'structured'."
+            )
+
+        self.last_final_answer_policy = effective_policy
+        self.last_final_answer_source = ""
+        self.last_summary_completeness = ""
+        self.last_exit_type = ""
+
+        initial_memory = ""
+        last_contexts: List[str] = []
+        warm_up_result: Optional[Dict[str, Any]] = None
+        warm_up_retrieval_record: Optional[Dict[str, Any]] = None
+
         print(f"\n\n{Fore.CYAN}{self.MODEL_NAME} answering: {question}{Style.RESET_ALL}\n\n")
 
         self._log_progress(
@@ -1024,7 +1312,82 @@ Output schema:
             corpus_docs=len(self.corpus),
             top_k=self.top_k,
             filter_repeats=self.filter_repeats,
+            max_rounds=effective_max_rounds,
+            warm_up=effective_enable_warm_up,
+            early_stop=effective_enable_early_stop,
+            final_answer_policy=effective_policy,
         )
+
+        # ===============================================
+        # == Stage 0: warm-up retrieval gate ==
+        # 공식 LogicRAG 스타일: 원 질문으로 먼저 검색하고,
+        # can_answer=True이면 DAG를 만들지 않고 즉시 반환한다.
+        # can_answer=False이면 warm-up summary를 Stage 5 initial_memory로 넘긴다.
+        # ===============================================
+        if effective_enable_warm_up:
+            stage_start_time = time.perf_counter()
+            self._log_progress("[Stage 0/6] Warm-up retrieval START")
+
+            warm_contexts = self._retrieve_for_query(
+                question,
+                retrieved_chunks_set=retrieved_chunks_set,
+            )
+            last_contexts = warm_contexts
+
+            initial_memory = self.refine_summary_with_context(
+                question=question,
+                new_contexts=warm_contexts,
+                current_summary="",
+            )
+
+            warm_up_result = self.warm_up_analysis(
+                question=question,
+                info_summary=initial_memory,
+            )
+
+            warm_up_retrieval_record = {
+                "round": 0,
+                "stage": "warm_up",
+                "query": question,
+                "contexts": warm_contexts,
+                "memory": initial_memory,
+                "analysis": warm_up_result,
+            }
+
+            dependency_analysis_history.append({
+                "stage": "warm_up",
+                "contexts": warm_contexts,
+                "initial_memory": initial_memory,
+                "analysis": warm_up_result,
+            })
+
+            self._log_progress(
+                "[Stage 0/6] Warm-up retrieval DONE",
+                start_time=stage_start_time,
+                can_answer=warm_up_result.get("can_answer", False),
+                dependencies=len(warm_up_result.get("dependencies", []) or []),
+            )
+
+            if self._coerce_bool(warm_up_result.get("can_answer", False)):
+                answer = self.generate_answer(
+                    question=question,
+                    info_summary=initial_memory,
+                )
+                self.last_final_answer_source = "warmup_generate"
+                self.last_summary_completeness = "none"
+                self.last_exit_type = "warmup_exit"
+
+                self._log_progress(
+                    "[DONE] LogicRAG answer_question",
+                    start_time=total_start_time,
+                    rounds=0,
+                    warm_up_early_return=True,
+                )
+
+                self.last_dependency_analysis = dependency_analysis_history
+                self.last_retrieval_history = [warm_up_retrieval_record]
+
+                return answer, last_contexts, 0
 
         # ===============================================
         # == Stage 1: query decomposition ==
@@ -1177,6 +1540,9 @@ Output schema:
         self._log_progress(
             "[Stage 5/6] Parent-conditioned rank resolution START",
             max_dynamic_adaptations=self.max_dynamic_adaptations,
+            max_rounds=effective_max_rounds,
+            early_stop=effective_enable_early_stop,
+            initial_memory_chars=len(initial_memory or ""),
         )
 
         stage5_result = rank_resolver.run(
@@ -1184,11 +1550,12 @@ Output schema:
             dag_result=final_dag_result,
             topological_rank_result=topological_rank_result,
             sorted_dependencies=sorted_dependencies,
-            initial_memory="",
+            initial_memory=initial_memory,
             retrieved_chunks_set=retrieved_chunks_set,
-            max_rounds=None,
+            max_rounds=effective_max_rounds,
             dag=runtime_dag,
             max_dynamic_adaptations=self.max_dynamic_adaptations,
+            enable_early_stop=effective_enable_early_stop,
         )
 
         last_contexts = stage5_result["last_contexts"]
@@ -1201,6 +1568,8 @@ Output schema:
             start_time=stage_start_time,
             rounds=round_count,
             dynamic_adaptations=len(stage5_result.get("dynamic_adaptations", []) or []),
+            early_stopped=stage5_result.get("early_stopped", False),
+            hit_max_rounds=stage5_result.get("hit_max_rounds", False),
         )
 
         self.last_query_logic_dag = runtime_dag
@@ -1210,11 +1579,16 @@ Output schema:
             "stage": "parent_answer_conditioned_rank_resolution_with_rolling_memory",
             "rank_groups": stage5_result["rank_groups"],
             "processed_rank_groups": stage5_result["processed_rank_groups"],
+            "unprocessed_rank_groups": stage5_result.get("unprocessed_rank_groups", []),
             "resolved_answers_by_node_id": stage5_result["resolved_answers_by_node_id"],
             "final_memory": stage5_result["final_memory"],
             "final_subanswer_summary": final_subanswer_summary,
             "retrieval_history": retrieval_history,
             "dynamic_adaptations": stage5_result.get("dynamic_adaptations", []),
+            "early_stopped": stage5_result.get("early_stopped", False),
+            "early_stop_result": stage5_result.get("early_stop_result"),
+            "hit_max_rounds": stage5_result.get("hit_max_rounds", False),
+            "max_rounds": stage5_result.get("max_rounds"),
             "final_query_logic_dag": runtime_dag.to_dict(),
         })
 
@@ -1231,14 +1605,132 @@ Output schema:
         stage_start_time = time.perf_counter()
         self._log_progress("[Stage 6/6] Final answer composition START")
 
-        answer = self.compose_final_answer(
-            question=question,
-            subanswer_summary=final_subanswer_summary,
-        )
+        final_memory = stage5_result.get("final_memory", "")
+        early_stopped = stage5_result.get("early_stopped", False)
+        hit_max_rounds = stage5_result.get("hit_max_rounds", False)
+        has_valid_summary = self._is_valid_final_subanswer_summary(final_subanswer_summary)
+
+        if effective_policy == "generate":
+            if early_stopped:
+                answer = self.generate_answer(
+                    question=question,
+                    info_summary=final_memory,
+                )
+                self.last_final_answer_source = "earlystop_generate"
+                self.last_summary_completeness = "none"
+                self.last_exit_type = "earlystop_exit"
+            elif hit_max_rounds:
+                answer = self.generate_answer(
+                    question=question,
+                    info_summary=final_memory,
+                )
+                self.last_final_answer_source = "maxround_generate"
+                self.last_summary_completeness = "none"
+                self.last_exit_type = "maxround_exit"
+            else:
+                answer = self.generate_answer(
+                    question=question,
+                    info_summary=final_memory,
+                )
+                self.last_final_answer_source = "normal_generate"
+                self.last_summary_completeness = "none"
+                self.last_exit_type = "normal_completion"
+        elif early_stopped:
+            early_stop_result = stage5_result.get("early_stop_result") or {}
+            judgement = early_stop_result.get("judgement") or {}
+            if not isinstance(judgement, dict):
+                judgement = {}
+            a15_final_answer = str(judgement.get("final_answer") or "").strip()
+
+            if a15_final_answer:
+                answer = a15_final_answer
+                self.last_final_answer_source = "earlystop_a15"
+                self.last_summary_completeness = "none"
+                self.last_exit_type = "earlystop_exit"
+            elif has_valid_summary:
+                answer = self.compose_final_answer(
+                    question=question,
+                    subanswer_summary=final_subanswer_summary,
+                )
+                if answer and str(answer).strip():
+                    self.last_final_answer_source = "earlystop_compose_fallback"
+                    self.last_summary_completeness = "partial"
+                    self.last_exit_type = "earlystop_exit"
+                else:
+                    answer = self.generate_answer(
+                        question=question,
+                        info_summary=final_memory,
+                    )
+                    self.last_final_answer_source = "earlystop_generate_fallback"
+                    self.last_summary_completeness = "none"
+                    self.last_exit_type = "earlystop_exit"
+            else:
+                answer = self.generate_answer(
+                    question=question,
+                    info_summary=final_memory,
+                )
+                self.last_final_answer_source = "earlystop_generate_fallback"
+                self.last_summary_completeness = "none"
+                self.last_exit_type = "earlystop_exit"
+        elif hit_max_rounds:
+            if has_valid_summary:
+                answer = self.compose_final_answer(
+                    question=question,
+                    subanswer_summary=final_subanswer_summary,
+                )
+                if answer and str(answer).strip():
+                    self.last_final_answer_source = "maxround_compose"
+                    self.last_summary_completeness = "partial"
+                    self.last_exit_type = "maxround_exit"
+                else:
+                    answer = self.generate_answer(
+                        question=question,
+                        info_summary=final_memory,
+                    )
+                    self.last_final_answer_source = "maxround_generate_fallback"
+                    self.last_summary_completeness = "none"
+                    self.last_exit_type = "maxround_exit"
+            else:
+                answer = self.generate_answer(
+                    question=question,
+                    info_summary=final_memory,
+                )
+                self.last_final_answer_source = "maxround_generate_fallback"
+                self.last_summary_completeness = "none"
+                self.last_exit_type = "maxround_exit"
+        else:
+            if has_valid_summary:
+                answer = self.compose_final_answer(
+                    question=question,
+                    subanswer_summary=final_subanswer_summary,
+                )
+                if answer and str(answer).strip():
+                    self.last_final_answer_source = "normal_compose"
+                    self.last_summary_completeness = "complete"
+                    self.last_exit_type = "normal_completion"
+                else:
+                    answer = self.generate_answer(
+                        question=question,
+                        info_summary=final_memory,
+                    )
+                    self.last_final_answer_source = "normal_generate_fallback"
+                    self.last_summary_completeness = "none"
+                    self.last_exit_type = "normal_completion"
+            else:
+                answer = self.generate_answer(
+                    question=question,
+                    info_summary=final_memory,
+                )
+                self.last_final_answer_source = "normal_generate_fallback"
+                self.last_summary_completeness = "none"
+                self.last_exit_type = "normal_completion"
 
         self._log_progress(
             "[Stage 6/6] Final answer composition DONE",
             start_time=stage_start_time,
+            source=self.last_final_answer_source,
+            summary_completeness=self.last_summary_completeness,
+            exit_type=self.last_exit_type,
         )
 
         self._log_progress(
@@ -1246,9 +1738,16 @@ Output schema:
             start_time=total_start_time,
             rounds=round_count,
             dynamic_adaptations=len(stage5_result.get("dynamic_adaptations", []) or []),
+            early_stopped=stage5_result.get("early_stopped", False),
+            hit_max_rounds=stage5_result.get("hit_max_rounds", False),
         )
 
+        combined_retrieval_history = []
+        if warm_up_retrieval_record is not None:
+            combined_retrieval_history.append(warm_up_retrieval_record)
+        combined_retrieval_history.extend(retrieval_history)
+
         self.last_dependency_analysis = dependency_analysis_history
-        self.last_retrieval_history = retrieval_history
+        self.last_retrieval_history = combined_retrieval_history
 
         return answer, last_contexts, round_count
