@@ -3,7 +3,6 @@ import logging
 import re
 import json
 import time
-import backoff
 from openai import OpenAI
 from ratelimit import limits, sleep_and_retry
 from collections import Counter
@@ -53,38 +52,34 @@ Format your response as:
 
 @sleep_and_retry
 @limits(calls=CALLS_PER_MINUTE, period=PERIOD)
-@backoff.on_exception(
-    backoff.expo,
-    (Exception),
-    max_tries=MAX_RETRIES,
-    max_time=300
-)
 def get_response_with_retry(prompt: str, temperature: float = 0.0, print_cost: bool = False) -> str:
     """Get response from OpenAI API with retry logic."""
     global TOKEN_COST
-    try:
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": prompt}
-        ]
-        response = client.chat.completions.create(
-            model=DEFAULT_MODEL,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=DEFAULT_MAX_TOKENS
-        )
-        # Update token costs
-        if response.usage:
-            TOKEN_COST["prompt"] += response.usage.prompt_tokens
-            TOKEN_COST["completion"] += response.usage.completion_tokens
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": prompt}
+    ]
+    response = client.chat.completions.create(
+        model=DEFAULT_MODEL,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=DEFAULT_MAX_TOKENS
+    )
+
+    # Update token costs
+    usage = response.usage
+    if usage is not None:
+        TOKEN_COST["prompt"] += usage.prompt_tokens
+        TOKEN_COST["completion"] += usage.completion_tokens
         if print_cost:
-            logger.info(f"Prompt tokens: {response.usage.prompt_tokens}")
-            logger.info(f"Completion tokens: {response.usage.completion_tokens}")
-            logger.info(f"Total tokens: {response.usage.total_tokens}")
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"Error in get_response_with_retry: {str(e)}")
+            logger.info(f"Prompt tokens: {usage.prompt_tokens}")
+            logger.info(f"Completion tokens: {usage.completion_tokens}")
+            logger.info(f"Total tokens: {usage.total_tokens}")
+
+    content = response.choices[0].message.content
+    if content is None:
         return ""
+    return content.strip()
 
 def fix_json_response(response: str) -> str:
     """Fix JSON response from OpenAI API.
@@ -245,4 +240,4 @@ def string_based_evaluation(generated: str, gold: str) -> dict:
         "precision": precision,
         "recall": recall,
         "f1": f1,
-    } 
+    }

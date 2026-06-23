@@ -3,6 +3,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Set, Tuple
 
+from openai import APIError
+
 from src.utils.utils import get_response_with_retry, fix_json_response
 
 
@@ -697,7 +699,16 @@ Return ONLY a JSON object with this schema:
 }}
 """
 
-        response = get_response_with_retry(prompt)
+        try:
+            response = get_response_with_retry(prompt)
+        except APIError as e:
+            logger.error(
+                "Dependency edge inference APIError %s: %s",
+                e.__class__.__name__,
+                e,
+            )
+            return []
+
         response = response.strip()
         response = response.replace("```json", "").replace("```", "")
 
