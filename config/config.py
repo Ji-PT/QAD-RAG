@@ -18,8 +18,6 @@ WANDB_API_KEY = os.getenv("WANDB_API_KEY")
 # API Rate Limiting Configuration
 CALLS_PER_MINUTE = 20
 PERIOD = 60
-MAX_RETRIES = 3
-RETRY_DELAY = 120
 
 # Model Configuration
 DEFAULT_MODEL = "gpt-4o-mini"

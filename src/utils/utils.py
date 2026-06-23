@@ -14,9 +14,7 @@ from config.config import (
     DEFAULT_MODEL,
     DEFAULT_MAX_TOKENS,
     CALLS_PER_MINUTE,
-    PERIOD,
-    MAX_RETRIES,
-    RETRY_DELAY
+    PERIOD
 )
 
 # Initialize colorama
