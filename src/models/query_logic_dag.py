@@ -447,7 +447,7 @@ class QueryLogicDAGBuilder:
         """
         nodes = self._build_nodes_from_subproblems(subproblems)
 
-        raw_edges = self._infer_dependency_edges(
+        raw_edges, edge_inference_status = self._infer_dependency_edges(
             question=question,
             nodes=nodes,
         )
@@ -462,6 +462,7 @@ class QueryLogicDAGBuilder:
             nodes=nodes,
             edges=edges,
             construction_source="query_decomposition",
+            edge_inference_status=edge_inference_status,
         )
 
         return dag
@@ -499,7 +500,7 @@ class QueryLogicDAGBuilder:
 
         nodes = self._build_nodes_from_subproblems(subproblems)
 
-        raw_edges = self._infer_dependency_edges(
+        raw_edges, edge_inference_status = self._infer_dependency_edges(
             question=question,
             nodes=nodes,
         )
@@ -514,6 +515,7 @@ class QueryLogicDAGBuilder:
             nodes=nodes,
             edges=edges,
             construction_source="existing_dependency_texts",
+            edge_inference_status=edge_inference_status,
         )
 
         return dag
@@ -524,6 +526,7 @@ class QueryLogicDAGBuilder:
         nodes: Dict[int, SubproblemNode],
         edges: List[DependencyEdge],
         construction_source: str,
+        edge_inference_status: str,
     ) -> QueryLogicDAG:
         """
         node 집합 V와 edge 집합 E를 QueryLogicDAG 객체로 묶는다.
@@ -542,6 +545,7 @@ class QueryLogicDAGBuilder:
                 "graph_type": GRAPH_TYPE_QUERY_LOGIC_DEPENDENCY_GRAPH,
                 "construction_source": construction_source,
                 "edge_semantics": "logical_dependencies",
+                "edge_inference_status": edge_inference_status,
                 "is_acyclic_verified": False,
             },
         )
@@ -605,7 +609,7 @@ class QueryLogicDAGBuilder:
         self,
         question: str,
         nodes: Dict[int, SubproblemNode],
-    ) -> List[DependencyEdge]:
+    ) -> Tuple[List[DependencyEdge], str]:
         """
         LLM을 사용해 subproblem 사이의 logical dependency edge를 추론한다.
 
@@ -707,22 +711,26 @@ Return ONLY a JSON object with this schema:
                 e.__class__.__name__,
                 e,
             )
-            return []
+            return [], "api_error"
 
         response = response.strip()
         response = response.replace("```json", "").replace("```", "")
 
         result = fix_json_response(response)
 
-        if result is None:
+        if not isinstance(result, dict):
             logger.warning("Failed to parse dependency edge inference response.")
-            return []
+            return [], "invalid_output"
 
-        raw_edges = result.get("edges", [])
+        if "edges" not in result:
+            logger.warning("Dependency edge inference result missing 'edges'.")
+            return [], "invalid_output"
+
+        raw_edges = result["edges"]
 
         if not isinstance(raw_edges, list):
             logger.warning("Dependency edge inference result has non-list 'edges'.")
-            return []
+            return [], "invalid_output"
 
         edges: List[DependencyEdge] = []
 
@@ -754,7 +762,7 @@ Return ONLY a JSON object with this schema:
                 logger.warning(f"Skipping malformed dependency edge: {raw_edge}. Error: {e}")
                 continue
 
-        return edges
+        return edges, "ok"
 
     def _validate_dependency_edges(
         self,

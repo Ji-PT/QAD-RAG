@@ -3,10 +3,10 @@ import logging
 import re
 import json
 import time
-from openai import OpenAI
+from openai import OpenAI, APIError
 from ratelimit import limits, sleep_and_retry
 from collections import Counter
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple, Optional
 from colorama import Fore, Style, init
 from config.config import (
     OPENAI_API_KEY,
@@ -165,10 +165,10 @@ def save_results(results: Dict, output_file: str, results_dir: str = 'result'):
         json.dump(results, f, ensure_ascii=False, indent=2)
     logger.info(f"Results saved to {output_path}")
 
-def evaluate_with_llm(generated: str, gold: str) -> bool:
+def evaluate_with_llm(generated: str, gold: str) -> Tuple[str, Optional[str], Optional[bool]]:
     """Use LLM to evaluate if the generated answer correctly answers the question."""
     if not isinstance(generated, str) or not isinstance(gold, str):
-        return False
+        raise TypeError("generated and gold must both be strings")
         
     prompt = f"""You are an expert evaluator. Please evaluate if the generated answer is correct by comparing it with the gold answer.
 
@@ -185,10 +185,19 @@ Response:"""
 
     try:
         response = get_response_with_retry(prompt, temperature=0.0, print_cost=True)
-        return response.strip().lower() == "correct"
-    except Exception as e:
-        logger.error(f"Error in LLM evaluation: {e}")
-        return False
+    except APIError as e:
+        logger.error(f"Judge APIError in evaluate_with_llm: {e}")
+        return "api_error", None, None
+
+    normalized = response.strip().lower()
+
+    if normalized == "correct":
+        return "ok", response, True
+
+    if normalized == "incorrect":
+        return "ok", response, False
+
+    return "invalid_output", response, None
 
 def string_based_evaluation(generated: str, gold: str) -> dict:
     """Evaluate string similarity between generated and gold answers.
