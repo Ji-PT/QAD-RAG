@@ -4,6 +4,8 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from openai import APIError
+
 from src.models.base_rag import BaseRAG
 from src.models.query_logic_dag import (
     QueryLogicDAGBuilder,
@@ -118,6 +120,8 @@ class LogicRAG(BaseRAG):
         self.last_final_answer_source = ""
         self.last_summary_completeness = ""
         self.last_exit_type = ""
+        self.last_answer_status = None
+        self.last_answer_failure_type = None
 
     @staticmethod
     def _format_elapsed(start_time: float) -> str:
@@ -779,8 +783,7 @@ Return ONLY a JSON object with this schema:
         Used for warm-up early return, rank-level early stop, and max_rounds
         budget exhaustion.
         """
-        try:
-            prompt = f"""You must give ONLY the direct final answer in the most concise way possible.
+        prompt = f"""You must give ONLY the direct final answer in the most concise way possible.
 
 Question:
 {question}
@@ -799,11 +802,24 @@ Rules:
 
 Final answer:
 """
-            return get_response_with_retry(prompt).strip()
+        try:
+            result = get_response_with_retry(prompt).strip()
 
-        except Exception as e:
-            logger.error(f"{Fore.RED}Error generating answer: {e}{Style.RESET_ALL}")
+        except APIError as e:
+            logger.error(f"{Fore.RED}APIError in generate_answer: {e}{Style.RESET_ALL}")
+            self.last_answer_status = "failed"
+            self.last_answer_failure_type = "api_error"
             return ""
+
+        if result:
+            self.last_answer_status = "ok"
+            self.last_answer_failure_type = None
+        else:
+            logger.warning(f"{Fore.YELLOW}Empty content in generate_answer.{Style.RESET_ALL}")
+            self.last_answer_status = "failed"
+            self.last_answer_failure_type = "empty_content"
+
+        return result
 
     # ==================================================================
     # Final composition
@@ -813,8 +829,7 @@ Final answer:
         """
         논문 Algorithm 1의 마지막 단계 Compose({a_i})를 수행한다.
         """
-        try:
-            prompt = f"""You must compose the final answer using ONLY the intermediate subproblem answers.
+        prompt = f"""You must compose the final answer using ONLY the intermediate subproblem answers.
 
 Original question:
 {question}
@@ -833,11 +848,24 @@ Rules:
 
 Final answer:
 """
-            return get_response_with_retry(prompt).strip()
+        try:
+            result = get_response_with_retry(prompt).strip()
 
-        except Exception as e:
-            logger.error(f"{Fore.RED}Error composing final answer: {e}{Style.RESET_ALL}")
+        except APIError as e:
+            logger.error(f"{Fore.RED}APIError in compose_final_answer: {e}{Style.RESET_ALL}")
+            self.last_answer_status = "failed"
+            self.last_answer_failure_type = "api_error"
             return ""
+
+        if result:
+            self.last_answer_status = "ok"
+            self.last_answer_failure_type = None
+        else:
+            logger.warning(f"{Fore.YELLOW}Empty content in compose_final_answer.{Style.RESET_ALL}")
+            self.last_answer_status = "failed"
+            self.last_answer_failure_type = "empty_content"
+
+        return result
 
     # ==================================================================
     # DAG verification / repair helpers
@@ -1298,6 +1326,8 @@ Output schema:
         self.last_final_answer_source = ""
         self.last_summary_completeness = ""
         self.last_exit_type = ""
+        self.last_answer_status = None
+        self.last_answer_failure_type = None
 
         initial_memory = ""
         last_contexts: List[str] = []
@@ -1647,6 +1677,8 @@ Output schema:
                 self.last_final_answer_source = "earlystop_a15"
                 self.last_summary_completeness = "none"
                 self.last_exit_type = "earlystop_exit"
+                self.last_answer_status = "ok"
+                self.last_answer_failure_type = None
             elif has_valid_summary:
                 answer = self.compose_final_answer(
                     question=question,
