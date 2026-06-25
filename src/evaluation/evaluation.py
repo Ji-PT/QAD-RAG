@@ -42,6 +42,14 @@ RAG_MODELS = {
 # Directory for checkpoints
 CHECKPOINT_DIR = os.path.join(RESULT_DIR, "checkpoints")
 DEFAULT_CHECKPOINT_INTERVAL = 5  # Default: save checkpoint every 5 questions
+PHASE3_COUNTER_KEYS = [
+    "answer_empty_content_count",
+    "answer_api_error_count",
+    "judge_api_error_count",
+    "judge_invalid_output_count",
+    "edge_inference_api_error_count",
+    "edge_inference_invalid_output_count",
+]
 
 class RAGEvaluator:
     """Evaluator for RAG models."""
@@ -143,9 +151,50 @@ class RAGEvaluator:
         
         answer, contexts, rounds = self.model.answer_question(question)
         elapsed_time = time.time() - start_time
-        
-        # Evaluate answer with LLM
-        is_correct = evaluate_with_llm(answer, gold_answer)
+
+        answer_status = self.model.last_answer_status
+        answer_failure_type = self.model.last_answer_failure_type
+
+        if answer_status == "ok" and answer_failure_type is None:
+            judge_status, judge_raw_response, is_correct = evaluate_with_llm(
+                answer,
+                gold_answer,
+            )
+        elif answer_status == "failed" and answer_failure_type == "empty_content":
+            judge_status = "not_run"
+            judge_raw_response = None
+            is_correct = False
+        elif answer_status == "failed" and answer_failure_type == "api_error":
+            judge_status = "not_run"
+            judge_raw_response = None
+            is_correct = None
+        else:
+            raise ValueError(
+                "Inconsistent final-answer status: "
+                f"status={answer_status!r}, failure_type={answer_failure_type!r}"
+            )
+
+        edge_inference_status = "not_run"
+        dependency_analysis = getattr(self.model, "last_dependency_analysis", [])
+
+        for entry in dependency_analysis:
+            if not isinstance(entry, dict):
+                continue
+
+            if entry.get("stage") != "query_logic_dag_construction":
+                continue
+
+            query_logic_dag = entry.get("query_logic_dag", {})
+            metadata = query_logic_dag.get("metadata", {}) if isinstance(query_logic_dag, dict) else {}
+            edge_inference_status = metadata.get("edge_inference_status")
+
+            if edge_inference_status not in {"ok", "api_error", "invalid_output"}:
+                raise ValueError(
+                    "Invalid edge_inference_status in query_logic_dag_construction: "
+                    f"{edge_inference_status!r}"
+                )
+
+            break
         
         result = {
             "question": question,
@@ -154,6 +203,11 @@ class RAGEvaluator:
             "contexts": contexts,
             "time": elapsed_time,
             "rounds": rounds,
+            "answer_status": answer_status,
+            "answer_failure_type": answer_failure_type,
+            "edge_inference_status": edge_inference_status,
+            "judge_status": judge_status,
+            "judge_raw_response": judge_raw_response,
             "is_correct": is_correct,
             "final_answer_policy": getattr(self.model, "last_final_answer_policy", ""),
             "final_answer_source": getattr(self.model, "last_final_answer_source", ""),
@@ -209,12 +263,6 @@ class RAGEvaluator:
     def _save_checkpoint(self, results: List[Dict], metrics: Dict, processed_count: int, output_file: str):
         """Save a checkpoint of current evaluation progress."""
 
-        # If the last "answer" is empty in the results, it indicates that we have lost connection to the LLM API
-        # We should not save the checkpoint in this case, and we should terminate the whole pipeline
-        if results[-1]["answer"] == "":
-            print("\n\n\033[91mLost connection to the LLM API, skipping checkpoint save\033[0m\n\n")
-            exit(1)  # Use exit code 1 to indicate error condition
-
         checkpoint = {
             "model": self.model_name,
             "metrics": metrics,
@@ -261,6 +309,19 @@ class RAGEvaluator:
 
         # Try to load checkpoint
         results, metrics, processed_count = self._load_checkpoint(output_file)
+
+        if processed_count > 0:
+            missing_phase3_keys = [
+                key
+                for key in PHASE3_COUNTER_KEYS
+                if key not in metrics
+            ]
+
+            if missing_phase3_keys:
+                raise ValueError(
+                    "Checkpoint was created before Phase 3; use a new "
+                    f"output/checkpoint. Missing counters: {missing_phase3_keys}"
+                )
         
         # Skip already processed questions
         if processed_count > 0:
@@ -293,6 +354,12 @@ class RAGEvaluator:
                 "string_precision": 0,
                 "string_recall": 0,
                 "string_f1": 0,
+                "answer_empty_content_count": 0,
+                "answer_api_error_count": 0,
+                "judge_api_error_count": 0,
+                "judge_invalid_output_count": 0,
+                "edge_inference_api_error_count": 0,
+                "edge_inference_invalid_output_count": 0,
             }
             
             # Add top-k hits for each k in eval_top_ks
@@ -335,16 +402,53 @@ class RAGEvaluator:
             metrics["total_time"] += result["time"]
             normalized_gold = normalize_answer(gold_answer)
 
+            answer_status = result["answer_status"]
+            answer_failure_type = result["answer_failure_type"]
+            judge_status = result["judge_status"]
+            edge_inference_status = result["edge_inference_status"]
+
+            if answer_failure_type == "empty_content":
+                metrics["answer_empty_content_count"] += 1
+
+            if answer_failure_type == "api_error":
+                metrics["answer_api_error_count"] += 1
+
+            if judge_status == "api_error":
+                metrics["judge_api_error_count"] += 1
+
+            if judge_status == "invalid_output":
+                metrics["judge_invalid_output_count"] += 1
+
+            if edge_inference_status == "api_error":
+                metrics["edge_inference_api_error_count"] += 1
+
+            if edge_inference_status == "invalid_output":
+                metrics["edge_inference_invalid_output_count"] += 1
+
             # String-based evaluation
-            string_metrics = string_based_evaluation(
-                result["answer"],
-                gold_answer
-            )
-            metrics["exact_match"] += string_metrics["exact_match"]
-            metrics["string_accuracy"] += string_metrics["accuracy"]
-            metrics["string_precision"] += string_metrics["precision"]
-            metrics["string_recall"] += string_metrics["recall"]
-            metrics["string_f1"] += string_metrics["f1"]
+            include_string_metrics = answer_failure_type != "api_error"
+            string_metrics = None
+
+            if answer_status == "ok":
+                string_metrics = string_based_evaluation(
+                    result["answer"],
+                    gold_answer
+                )
+            elif answer_failure_type == "empty_content":
+                string_metrics = {
+                    "exact_match": 0,
+                    "accuracy": 0,
+                    "precision": 0,
+                    "recall": 0,
+                    "f1": 0,
+                }
+
+            if include_string_metrics:
+                metrics["exact_match"] += string_metrics["exact_match"]
+                metrics["string_accuracy"] += string_metrics["accuracy"]
+                metrics["string_precision"] += string_metrics["precision"]
+                metrics["string_recall"] += string_metrics["recall"]
+                metrics["string_f1"] += string_metrics["f1"]
 
             # Check retrieval coverage
             answer_in_context = 0
@@ -363,52 +467,112 @@ class RAGEvaluator:
                 metrics["total_rounds"] += result["rounds"]
 
             # Evaluate answer using LLM
-            if result["is_correct"]:
+            if result["is_correct"] is True:
                 metrics["answer_accuracy"] += 1
 
             # Progress log every 10 questions
             current_count = processed_count + i + 1
             correct_so_far = metrics["answer_accuracy"]
-            acc_so_far = correct_so_far / current_count * 100
-            pbar.set_postfix(acc=f"{acc_so_far:.1f}%", t=f"{result['time']:.0f}s")
+            running_llm_denom = (
+                current_count
+                - metrics["answer_api_error_count"]
+                - metrics["judge_api_error_count"]
+                - metrics["judge_invalid_output_count"]
+            )
+            running_llm_accuracy = (
+                correct_so_far / running_llm_denom * 100
+                if running_llm_denom > 0
+                else 0.0
+            )
+            running_string_denom = current_count - metrics["answer_api_error_count"]
+            running_exact_match = (
+                metrics["exact_match"] / running_string_denom * 100
+                if running_string_denom > 0
+                else 0.0
+            )
+            running_f1 = (
+                metrics["string_f1"] / running_string_denom * 100
+                if running_string_denom > 0
+                else 0.0
+            )
+            pbar.set_postfix(acc=f"{running_llm_accuracy:.1f}%", t=f"{result['time']:.0f}s")
             if current_count % 10 == 0 or i == len(eval_data) - 1:
                 tqdm.write(
                     f"[Q {current_count:>4}/{total_questions}] "
-                    f"acc={acc_so_far:.1f}% ({int(correct_so_far)}/{current_count}) | "
+                    f"acc={running_llm_accuracy:.1f}% "
+                    f"({int(correct_so_far)}/{running_llm_denom}) | "
                     f"avg_time={metrics['total_time'] / current_count:.1f}s/q"
                 )
 
             # wandb per-question logging
             if self._wandb_enabled:
-                wandb.log({
-                    "exact_match":          string_metrics["exact_match"],
-                    "f1":                   string_metrics["f1"],
-                    "llm_correct":          int(result["is_correct"]),
+                wandb_payload = {
                     "answer_in_context":    answer_in_context,
                     "time_per_q":           result["time"],
                     "rounds":               result.get("rounds", 0),
                     "prompt_tokens":        prompt_delta,
                     "completion_tokens":    completion_delta,
                     "cost_usd":             cost_delta_usd,
-                    "running_exact_match":  metrics["exact_match"]  / current_count * 100,
-                    "running_f1":           metrics["string_f1"]    / current_count * 100,
-                    "running_llm_accuracy": metrics["answer_accuracy"] / current_count * 100,
-                }, step=current_count)
+                    "running_exact_match":  running_exact_match,
+                    "running_f1":           running_f1,
+                    "running_llm_accuracy": running_llm_accuracy,
+                }
+
+                if include_string_metrics:
+                    wandb_payload["exact_match"] = string_metrics["exact_match"]
+                    wandb_payload["f1"] = string_metrics["f1"]
+
+                if result["is_correct"] is not None:
+                    wandb_payload["llm_correct"] = int(result["is_correct"])
+
+                wandb.log(wandb_payload, step=current_count)
 
             # Save checkpoint at regular intervals
             if (current_count % self.checkpoint_interval == 0) or (i == len(eval_data) - 1):
                 self._save_checkpoint(results, metrics, current_count, output_file)
         
+        llm_denom = (
+            total_questions
+            - metrics["answer_api_error_count"]
+            - metrics["judge_api_error_count"]
+            - metrics["judge_invalid_output_count"]
+        )
+        string_denom = total_questions - metrics["answer_api_error_count"]
+
         # Calculate average metrics
         avg_metrics = {
             "avg_time": metrics["total_time"] / total_questions,
             "answer_coverage": metrics["answer_coverage"] / total_questions * 100,
-            "answer_accuracy": metrics["answer_accuracy"] / total_questions * 100,
-            "exact_match": metrics["exact_match"] / total_questions * 100,
-            "string_accuracy": metrics["string_accuracy"] / total_questions * 100,
-            "string_precision": metrics["string_precision"] / total_questions * 100,
-            "string_recall": metrics["string_recall"] / total_questions * 100,
-            "string_f1": metrics["string_f1"] / total_questions * 100,
+            "answer_accuracy": (
+                metrics["answer_accuracy"] / llm_denom * 100
+                if llm_denom > 0
+                else 0.0
+            ),
+            "exact_match": (
+                metrics["exact_match"] / string_denom * 100
+                if string_denom > 0
+                else 0.0
+            ),
+            "string_accuracy": (
+                metrics["string_accuracy"] / string_denom * 100
+                if string_denom > 0
+                else 0.0
+            ),
+            "string_precision": (
+                metrics["string_precision"] / string_denom * 100
+                if string_denom > 0
+                else 0.0
+            ),
+            "string_recall": (
+                metrics["string_recall"] / string_denom * 100
+                if string_denom > 0
+                else 0.0
+            ),
+            "string_f1": (
+                metrics["string_f1"] / string_denom * 100
+                if string_denom > 0
+                else 0.0
+            ),
         }
         
         # Add top-k coverage (renamed from accuracy) for each k in eval_top_ks

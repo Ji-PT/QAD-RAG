@@ -12,7 +12,6 @@ setup(
         "openai",
         "tqdm",
         "numpy",
-        "backoff",
         "ratelimit",
     ],
     python_requires=">=3.7",

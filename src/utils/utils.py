@@ -3,11 +3,10 @@ import logging
 import re
 import json
 import time
-import backoff
-from openai import OpenAI
+from openai import OpenAI, APIError
 from ratelimit import limits, sleep_and_retry
 from collections import Counter
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple, Optional
 from colorama import Fore, Style, init
 from config.config import (
     OPENAI_API_KEY,
@@ -15,9 +14,7 @@ from config.config import (
     DEFAULT_MODEL,
     DEFAULT_MAX_TOKENS,
     CALLS_PER_MINUTE,
-    PERIOD,
-    MAX_RETRIES,
-    RETRY_DELAY
+    PERIOD
 )
 
 # Initialize colorama
@@ -53,38 +50,34 @@ Format your response as:
 
 @sleep_and_retry
 @limits(calls=CALLS_PER_MINUTE, period=PERIOD)
-@backoff.on_exception(
-    backoff.expo,
-    (Exception),
-    max_tries=MAX_RETRIES,
-    max_time=300
-)
 def get_response_with_retry(prompt: str, temperature: float = 0.0, print_cost: bool = False) -> str:
     """Get response from OpenAI API with retry logic."""
     global TOKEN_COST
-    try:
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": prompt}
-        ]
-        response = client.chat.completions.create(
-            model=DEFAULT_MODEL,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=DEFAULT_MAX_TOKENS
-        )
-        # Update token costs
-        if response.usage:
-            TOKEN_COST["prompt"] += response.usage.prompt_tokens
-            TOKEN_COST["completion"] += response.usage.completion_tokens
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": prompt}
+    ]
+    response = client.chat.completions.create(
+        model=DEFAULT_MODEL,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=DEFAULT_MAX_TOKENS
+    )
+
+    # Update token costs
+    usage = response.usage
+    if usage is not None:
+        TOKEN_COST["prompt"] += usage.prompt_tokens
+        TOKEN_COST["completion"] += usage.completion_tokens
         if print_cost:
-            logger.info(f"Prompt tokens: {response.usage.prompt_tokens}")
-            logger.info(f"Completion tokens: {response.usage.completion_tokens}")
-            logger.info(f"Total tokens: {response.usage.total_tokens}")
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"Error in get_response_with_retry: {str(e)}")
+            logger.info(f"Prompt tokens: {usage.prompt_tokens}")
+            logger.info(f"Completion tokens: {usage.completion_tokens}")
+            logger.info(f"Total tokens: {usage.total_tokens}")
+
+    content = response.choices[0].message.content
+    if content is None:
         return ""
+    return content.strip()
 
 def fix_json_response(response: str) -> str:
     """Fix JSON response from OpenAI API.
@@ -172,10 +165,10 @@ def save_results(results: Dict, output_file: str, results_dir: str = 'result'):
         json.dump(results, f, ensure_ascii=False, indent=2)
     logger.info(f"Results saved to {output_path}")
 
-def evaluate_with_llm(generated: str, gold: str) -> bool:
+def evaluate_with_llm(generated: str, gold: str) -> Tuple[str, Optional[str], Optional[bool]]:
     """Use LLM to evaluate if the generated answer correctly answers the question."""
     if not isinstance(generated, str) or not isinstance(gold, str):
-        return False
+        raise TypeError("generated and gold must both be strings")
         
     prompt = f"""You are an expert evaluator. Please evaluate if the generated answer is correct by comparing it with the gold answer.
 
@@ -192,10 +185,19 @@ Response:"""
 
     try:
         response = get_response_with_retry(prompt, temperature=0.0, print_cost=True)
-        return response.strip().lower() == "correct"
-    except Exception as e:
-        logger.error(f"Error in LLM evaluation: {e}")
-        return False
+    except APIError as e:
+        logger.error(f"Judge APIError in evaluate_with_llm: {e}")
+        return "api_error", None, None
+
+    normalized = response.strip().lower()
+
+    if normalized == "correct":
+        return "ok", response, True
+
+    if normalized == "incorrect":
+        return "ok", response, False
+
+    return "invalid_output", response, None
 
 def string_based_evaluation(generated: str, gold: str) -> dict:
     """Evaluate string similarity between generated and gold answers.
@@ -245,4 +247,4 @@ def string_based_evaluation(generated: str, gold: str) -> dict:
         "precision": precision,
         "recall": recall,
         "f1": f1,
-    } 
+    }
