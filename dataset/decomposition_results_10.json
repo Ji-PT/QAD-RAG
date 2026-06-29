@@ -1,0 +1,365 @@
+{
+  "prompt": "decompose_query() @ logic_rag.py:193",
+  "results": [
+    {
+      "sample_id": 1,
+      "hop_type": "2hop",
+      "question": "When was the person who Messi's goals in Copa del Rey compared to get signed by Barcelona?",
+      "gold_answer": "June 1982",
+      "model_answer_before": "Unknown",
+      "is_simple": false,
+      "model_subproblems": [
+        {
+          "id": 0,
+          "text": "Who is the person that Messi's goals in Copa del Rey were compared to?"
+        },
+        {
+          "id": 1,
+          "text": "When was this person born?"
+        },
+        {
+          "id": 2,
+          "text": "What were the circumstances of Messi's signing by Barcelona?"
+        }
+      ],
+      "gold_decomposition": [
+        {
+          "step": 1,
+          "question": "To whom was Messi's goal in the first leg of the Copa del Rey compared?",
+          "gold_answer": "Diego Maradona"
+        },
+        {
+          "step": 2,
+          "question": "When was #1 signed by Barcelona?",
+          "gold_answer": "June 1982"
+        }
+      ],
+      "n_model": 3,
+      "n_gold": 2,
+      "step_count_match": false
+    },
+    {
+      "sample_id": 2,
+      "hop_type": "2hop",
+      "question": "When was Lady Godiva's birthplace abolished?",
+      "gold_answer": "918",
+      "model_answer_before": "Unknown from the retrieved evidence.",
+      "is_simple": false,
+      "model_subproblems": [
+        {
+          "id": 0,
+          "text": "Where was Lady Godiva born?"
+        },
+        {
+          "id": 1,
+          "text": "When was this birthplace abolished?"
+        }
+      ],
+      "gold_decomposition": [
+        {
+          "step": 1,
+          "question": "Lady Godiva >> place of birth",
+          "gold_answer": "Mercia"
+        },
+        {
+          "step": 2,
+          "question": "When was #1 abolished?",
+          "gold_answer": "918"
+        }
+      ],
+      "n_model": 2,
+      "n_gold": 2,
+      "step_count_match": true
+    },
+    {
+      "sample_id": 3,
+      "hop_type": "unknown",
+      "question": "what is one of the stars of  The Newcomers known for",
+      "gold_answer": "superhero roles as the Marvel Comics",
+      "model_answer_before": "He is known for starring in The Newcomers and playing Sam Docherty.",
+      "is_simple": false,
+      "model_subproblems": [
+        {
+          "id": 0,
+          "text": "Who is one of the stars of The Newcomers?"
+        },
+        {
+          "id": 1,
+          "text": "What is this star known for?"
+        }
+      ],
+      "gold_decomposition": [],
+      "n_model": 2,
+      "n_gold": 0,
+      "step_count_match": false
+    },
+    {
+      "sample_id": 4,
+      "hop_type": "unknown",
+      "question": "The fictional private detective that appears in \"The Adventure of the Seven Clocks\" what written by whom?",
+      "gold_answer": "Sir Arthur Conan Doyle",
+      "model_answer_before": "Sherlock Holmes by Adrian Conan Doyle and John Dickson Carr.",
+      "is_simple": false,
+      "model_subproblems": [
+        {
+          "id": 0,
+          "text": "Who is the fictional private detective that appears in 'The Adventure of the Seven Clocks'?"
+        },
+        {
+          "id": 1,
+          "text": "Who wrote 'The Adventure of the Seven Clocks'?"
+        }
+      ],
+      "gold_decomposition": [],
+      "n_model": 2,
+      "n_gold": 0,
+      "step_count_match": false
+    },
+    {
+      "sample_id": 5,
+      "hop_type": "unknown",
+      "question": "Sparking the Marian civil war, who helped the recently abdicated queen to escape her imprisonment?",
+      "gold_answer": "the Queen's gaoler",
+      "model_answer_before": "Her gaoler's family",
+      "is_simple": false,
+      "model_subproblems": [
+        {
+          "id": 0,
+          "text": "Who was the recently abdicated queen?"
+        },
+        {
+          "id": 1,
+          "text": "Who helped this queen to escape her imprisonment?"
+        },
+        {
+          "id": 2,
+          "text": "What was the context of the Marian civil war?"
+        }
+      ],
+      "gold_decomposition": [],
+      "n_model": 3,
+      "n_gold": 0,
+      "step_count_match": false
+    },
+    {
+      "sample_id": 6,
+      "hop_type": "4hop1",
+      "question": "Where does the body of water by the city where the Southeast Library designer died empty into the Gulf of Mexico?",
+      "gold_answer": "the Mississippi River Delta",
+      "model_answer_before": null,
+      "is_simple": false,
+      "model_subproblems": [
+        {
+          "id": 0,
+          "text": "Who is the designer of the Southeast Library?"
+        },
+        {
+          "id": 1,
+          "text": "In which city did this designer die?"
+        },
+        {
+          "id": 2,
+          "text": "What body of water is located by this city?"
+        },
+        {
+          "id": 3,
+          "text": "Where does this body of water empty into the Gulf of Mexico?"
+        }
+      ],
+      "gold_decomposition": [
+        {
+          "step": 1,
+          "question": "The designer for Southeast Library was?",
+          "gold_answer": "Ralph Rapson"
+        },
+        {
+          "step": 2,
+          "question": "#1 >> place of death",
+          "gold_answer": "Minneapolis"
+        },
+        {
+          "step": 3,
+          "question": "Which is the body of water by #2 ?",
+          "gold_answer": "Mississippi River"
+        },
+        {
+          "step": 4,
+          "question": "where does #3 empty into the gulf of mexico",
+          "gold_answer": "the Mississippi River Delta"
+        }
+      ],
+      "n_model": 4,
+      "n_gold": 4,
+      "step_count_match": true
+    },
+    {
+      "sample_id": 7,
+      "hop_type": "3hop1",
+      "question": "When was the start of the battle of the birthplace of the performer of III?",
+      "gold_answer": "December 14, 1814",
+      "model_answer_before": null,
+      "is_simple": false,
+      "model_subproblems": [
+        {
+          "id": 0,
+          "text": "Who is the performer of III?"
+        },
+        {
+          "id": 1,
+          "text": "What is the birthplace of this performer?"
+        },
+        {
+          "id": 2,
+          "text": "When did the battle start at this birthplace?"
+        }
+      ],
+      "gold_decomposition": [
+        {
+          "step": 1,
+          "question": "III >> performer",
+          "gold_answer": "Stanton Moore"
+        },
+        {
+          "step": 2,
+          "question": "#1 >> place of birth",
+          "gold_answer": "New Orleans"
+        },
+        {
+          "step": 3,
+          "question": "when did the battle of #2 start",
+          "gold_answer": "December 14, 1814"
+        }
+      ],
+      "n_model": 3,
+      "n_gold": 3,
+      "step_count_match": true
+    },
+    {
+      "sample_id": 8,
+      "hop_type": "3hop1",
+      "question": "How many times did plague occur in the place where Crucifixion's creator died?",
+      "gold_answer": "22",
+      "model_answer_before": null,
+      "is_simple": false,
+      "model_subproblems": [
+        {
+          "id": 0,
+          "text": "Who is considered the creator of the Crucifixion?"
+        },
+        {
+          "id": 1,
+          "text": "In which place did this creator die?"
+        },
+        {
+          "id": 2,
+          "text": "How many times did plague occur in this place?"
+        }
+      ],
+      "gold_decomposition": [
+        {
+          "step": 1,
+          "question": "Crucifixion >> creator",
+          "gold_answer": "Titian"
+        },
+        {
+          "step": 2,
+          "question": "#1 >> place of death",
+          "gold_answer": "Venice"
+        },
+        {
+          "step": 3,
+          "question": "How many times did plague occur in #2 ?",
+          "gold_answer": "22"
+        }
+      ],
+      "n_model": 3,
+      "n_gold": 3,
+      "step_count_match": true
+    },
+    {
+      "sample_id": 9,
+      "hop_type": "4hop1",
+      "question": "Who is the child of the Italian navigator who explored the eastern coast of the continent César Gaytan was born in for the English?",
+      "gold_answer": "Sebastian Cabot",
+      "model_answer_before": null,
+      "is_simple": false,
+      "model_subproblems": [
+        {
+          "id": 0,
+          "text": "Who is the Italian navigator who explored the eastern coast of the continent?"
+        },
+        {
+          "id": 1,
+          "text": "Who is the child of this Italian navigator?"
+        }
+      ],
+      "gold_decomposition": [
+        {
+          "step": 1,
+          "question": "César Gaytan >> place of birth",
+          "gold_answer": "Guadalajara"
+        },
+        {
+          "step": 2,
+          "question": "#1 >> continent",
+          "gold_answer": "North America"
+        },
+        {
+          "step": 3,
+          "question": "who was the italian navigator sailing for england that explored the eastern coast of #2",
+          "gold_answer": "John Cabot"
+        },
+        {
+          "step": 4,
+          "question": "#3 >> child",
+          "gold_answer": "Sebastian Cabot"
+        }
+      ],
+      "n_model": 2,
+      "n_gold": 4,
+      "step_count_match": false
+    },
+    {
+      "sample_id": 10,
+      "hop_type": "3hop1",
+      "question": "When was the Palau de la Generalitat constructed in the city where Martin from the region where Perdiguera is located died?",
+      "gold_answer": "built in the 15th century",
+      "model_answer_before": null,
+      "is_simple": false,
+      "model_subproblems": [
+        {
+          "id": 0,
+          "text": "In which region is Perdiguera located?"
+        },
+        {
+          "id": 1,
+          "text": "Where did Martin from this region die?"
+        },
+        {
+          "id": 2,
+          "text": "When was the Palau de la Generalitat constructed in this city?"
+        }
+      ],
+      "gold_decomposition": [
+        {
+          "step": 1,
+          "question": "Perdiguera >> located in the administrative territorial entity",
+          "gold_answer": "Aragon"
+        },
+        {
+          "step": 2,
+          "question": "Martin of #1 >> place of death",
+          "gold_answer": "Barcelona"
+        },
+        {
+          "step": 3,
+          "question": "When was the Palau de la Generalitat in #2 constructed?",
+          "gold_answer": "built in the 15th century"
+        }
+      ],
+      "n_model": 3,
+      "n_gold": 3,
+      "step_count_match": true
+    }
+  ]
+}

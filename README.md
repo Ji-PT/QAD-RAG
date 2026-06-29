@@ -25,12 +25,15 @@ LogicRAG/
 │   │   ├── verify_non_cyclicity.py  # DAG 사이클 검증 + 위상 정렬
 │   │   ├── dag_topological_rank.py  # 위상 rank 계산
 │   │   └── dag_rank_resolver.py  # rank 단위 retrieval + Dynamic Adaptation
-│   ├── evaluation/evaluation.py  # 평가 루프, 체크포인트, 메트릭 집계
+│   ├── evaluation/
+│   │   ├── evaluation.py         # 평가 루프, 체크포인트, 메트릭 집계
+│   │   └── decomposition_eval.py # decompose_query() 결과 vs gold 비교 평가 - decomposition 실험
 │   └── utils/utils.py            # OpenAI 호출, JSON 파싱, 정규화 유틸
 │
 ├── dataset/                      # 벤치마크 데이터셋
 │   ├── musique.json              # 평가 질문 (1,000개)
-│   └── musique_corpus.json       # 검색 코퍼스 (11,656개)
+│   ├── musique_corpus.json       # 검색 코퍼스 (11,656개)
+│   └── musique_sample_100.json   # 계층별 샘플 100개 (4hop 30 / 3hop 30 / 2hop 40)
 │
 ├── cache/                        # 코퍼스 임베딩 캐시 (자동 생성)
 └── evaluation/                   # 평가 결과 및 체크포인트 (자동 생성)

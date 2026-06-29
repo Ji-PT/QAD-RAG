@@ -43,7 +43,7 @@ progress_logger = logging.getLogger("logicrag.progress")
 # decompose_query()의 프롬프트에서 참조
 # subproblems 형식: {"id", "text"} → QueryLogicDAGBuilder 입력 형식에 맞춤
 QUERY_DECOMPOSITION_FEW_SHOT_EXAMPLES = """
-Example 1:
+Example 1 (2-hop):
 Question: "Who is the mayor of the capital of France?"
 Subproblems:
 [
@@ -51,16 +51,14 @@ Subproblems:
   {"id": 1, "text": "Who is the mayor of this capital city?"}
 ]
 
-Example 2:
-Question: "When was the director of 'Inception' born, and what award did the film win at the Oscars?"
+Example 2 (single-hop):
+Question: "What is the tallest building in Tokyo?"
 Subproblems:
 [
-  {"id": 0, "text": "Who directed the film 'Inception'?"},
-  {"id": 1, "text": "When was this director born?"},
-  {"id": 2, "text": "What award did 'Inception' win at the Oscars?"}
+  {"id": 0, "text": "What is the tallest building in Tokyo?"}
 ]
 
-Example 3:
+Example 3 (3-hop):
 Question: "What is the population of the country where the inventor of the telephone was born?"
 Subproblems:
 [
@@ -69,11 +67,31 @@ Subproblems:
   {"id": 2, "text": "What is the population of this country?"}
 ]
 
-Example 4:
-Question: "What is the tallest building in Tokyo?"
+Example 4 (4-hop — nested entity chain, each lookup is a separate step):
+Question: "Who is the child of the navigator who explored the eastern coast of the continent where César Gaytan was born?"
 Subproblems:
 [
-  {"id": 0, "text": "What is the tallest building in Tokyo?"}
+  {"id": 0, "text": "Where was César Gaytan born?"},
+  {"id": 1, "text": "Which continent is this birthplace located in?"},
+  {"id": 2, "text": "Who was the navigator who explored the eastern coast of this continent?"},
+  {"id": 3, "text": "Who is the child of this navigator?"}
+]
+
+Example 5 (answer this question directly once the needed entity is found):
+Question: "Sparking the Marian civil war, who helped the recently abdicated queen to escape her imprisonment?"
+Subproblems:
+[
+  {"id": 0, "text": "Who was the recently abdicated queen involved in the Marian civil war?"},
+  {"id": 1, "text": "Who helped this queen to escape her imprisonment?"}
+]
+
+Example 6 (3-hop with direct attribute lookup — "Perdiguera" is already named, so its region is ONE step, not two):
+Question: "When was the Palau de la Generalitat constructed in the city where Martin from the region where Perdiguera is located died?"
+Subproblems:
+[
+  {"id": 0, "text": "In which region is Perdiguera located?"},
+  {"id": 1, "text": "Where did Martin from this region die?"},
+  {"id": 2, "text": "When was the Palau de la Generalitat constructed in this city?"}
 ]
 """
 
@@ -192,21 +210,32 @@ class LogicRAG(BaseRAG):
         try:
             prompt = f"""You are an expert at decomposing complex questions into smaller, logically ordered subproblems.
 
-Given a question, you must:
-1. Decompose the question into a minimal set of subproblems. Each subproblem must have an "id" (integer, starting from 0) and a "text" (the subproblem question string).
-2. If the question is simple (single-hop, no decomposition needed), output a single subproblem identical to the original question.
+    Given a question, decompose it into the minimum number of subproblems needed to answer it.
 
-Here are some examples:
-{QUERY_DECOMPOSITION_FEW_SHOT_EXAMPLES}
+    Rules:
+    1. Each subproblem must ask for exactly one fact that can be looked up independently.
+    2. Create a new subproblem only when its answer is needed as input for a later subproblem or for the final answer.
+    3. Do not add background, context, explanation, or verification steps that are not strictly necessary to reach the final answer.
+    4. If the question requires finding an intermediate entity before the next lookup can proceed, create one subproblem for each intermediate entity lookup.
+    5. If an entity is already explicitly named in the question and the question only requires one direct attribute of that entity, treat it as a single subproblem. Do not split a direct attribute lookup into multiple subproblems. For example, "Where was X born?" should not be split into "Who is X?" and "Where was X born?"
+    6. Do not decompose descriptive modifiers unless they are required to identify the target entity. Keep modifiers such as "recently abdicated," "famous," "largest," or "first" as constraints only when they are necessary to find the correct entity.
+    7. Each subproblem must preserve the original question's intent, key terms, constraints, and expected answer type. Do not remove or change dates, places, titles, organizations, relationships, or other constraints. If the original question asks "who," "when," "where," or "what," the final subproblem must preserve that answer type.
+    8. If a subproblem depends on the answer to a previous subproblem, refer to that answer clearly using phrases such as "this person," "this city," "this country," or "this entity."
+    9. If the question involves comparison, aggregation, or multiple independent targets, first create subproblems for the necessary entities or values, then add a final subproblem that performs the comparison, aggregation, or judgment.
+    10. If the question can be answered with a single independent lookup, output exactly one subproblem identical to the original question and mark "is_simple" as true.
 
-Now decompose the following question:
-Question: "{question}"
+    Here are some examples:
+    {QUERY_DECOMPOSITION_FEW_SHOT_EXAMPLES}
 
-Please format your response as a JSON object with these keys:
-- "subproblems": list of objects, each with "id" (int) and "text" (string)
-- "is_simple": boolean
+    Now decompose the following question:
+    Question: "{question}"
 
-Respond ONLY with the JSON object, no additional text."""
+    Please format your response as a JSON object with these keys:
+
+    * "subproblems": list of objects, each with "id" (int) and "text" (string)
+    * "is_simple": boolean
+
+    Respond ONLY with the JSON object, no additional text."""
 
             response = get_response_with_retry(prompt)
             response = response.strip().replace("```json", "").replace("```", "")

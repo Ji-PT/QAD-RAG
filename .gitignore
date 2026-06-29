@@ -1,7 +1,7 @@
 
 # Project-specific directory
 result/
-evaluation/
+/evaluation/
 
 # Environment variables
 .env
@@ -32,3 +32,5 @@ wandb/
 
 # Jupyter
 .ipynb_checkpoints/
+
+CODE_GUIDE.md
