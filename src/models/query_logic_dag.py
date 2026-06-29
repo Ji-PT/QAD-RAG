@@ -655,13 +655,18 @@ prerequisite_id -> dependent_id
 Rules:
 - Use only ids from the provided subproblem nodes.
 - Do not create self-loops.
+- Do not infer dependencies from node order or id order. A lower id does not automatically mean it is a prerequisite of a higher id.
 - Do not include independent nodes in edges.
 - Do not create an edge merely because two subproblems are topically related.
-- Create an edge only when there is logical precedence.
+- Create an edge only when the dependent subproblem cannot be answered without the output of the prerequisite subproblem.
+- In other words, create an edge only when there is direct logical precedence.
 - Prefer direct logical dependencies only.
 - Do not add redundant transitive edges.
-  For example, if 0 -> 1 and 1 -> 2, do not also add 0 -> 2 unless it is directly necessary.
-- Each edge must include a short reason.
+  For example, if 0 -> 1 and 1 -> 2, do not also add 0 -> 2 unless node 2 directly uses the output of node 0.
+- If two subproblems can be answered independently, do not connect them, even if both are needed for a later comparison, aggregation, or judgment.
+- For comparison, aggregation, or final judgment nodes, connect each required input subproblem directly to that final node.
+- The output graph must be acyclic. If a proposed edge would create a cycle, do not include it.
+- Each edge must include a short reason explaining why the dependent node needs the prerequisite node's output.
 - If no logical dependencies exist, return an empty edge list.
 
 Few-shot example:
