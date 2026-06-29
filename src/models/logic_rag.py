@@ -93,6 +93,23 @@ Subproblems:
   {"id": 1, "text": "Where did Martin from this region die?"},
   {"id": 2, "text": "When was the Palau de la Generalitat constructed in this city?"}
 ]
+
+Example 7 (multi-anchor — both anchor locations must be independently looked up before the final relational step; the final step asks about ALL anchors together, not each separately):
+Question: "What strait lies between the country that contains Tangier and the country where Gibraltar is located?"
+Subproblems:
+[
+  {"id": 0, "text": "Which country contains Tangier?"},
+  {"id": 1, "text": "Which country is Gibraltar located in?"},
+  {"id": 2, "text": "What strait lies between these two countries?"}
+]
+
+Example 8 (compound question — the result of the first lookup is used in a different context for the second lookup; read the full question and include both parts):
+Question: "What character did the voice actor of Buzz Lightyear in Toy Story play in Home Improvement?"
+Subproblems:
+[
+  {"id": 0, "text": "Who voiced Buzz Lightyear in Toy Story?"},
+  {"id": 1, "text": "What character did this actor play in Home Improvement?"}
+]
 """
 
 
@@ -216,13 +233,15 @@ class LogicRAG(BaseRAG):
     1. Each subproblem must ask for exactly one fact that can be looked up independently.
     2. Create a new subproblem only when its answer is needed as input for a later subproblem or for the final answer.
     3. Do not add background, context, explanation, or verification steps that are not strictly necessary to reach the final answer.
-    4. If the question requires finding an intermediate entity before the next lookup can proceed, create one subproblem for each intermediate entity lookup.
+    4. If the question requires finding an intermediate entity before the next lookup can proceed, create one subproblem for each intermediate entity lookup. This includes possessive property chains: if "X's Y" (e.g., "Amissah's religion", "Mankatha's record label") is used as input for a later lookup, then "What is X's Y?" must be its own subproblem — never combine the property lookup with the step that depends on it.
     5. If an entity is already explicitly named in the question and the question only requires one direct attribute of that entity, treat it as a single subproblem. Do not split a direct attribute lookup into multiple subproblems. For example, "Where was X born?" should not be split into "Who is X?" and "Where was X born?"
     6. Do not decompose descriptive modifiers unless they are required to identify the target entity. Keep modifiers such as "recently abdicated," "famous," "largest," or "first" as constraints only when they are necessary to find the correct entity.
     7. Each subproblem must preserve the original question's intent, key terms, constraints, and expected answer type. Do not remove or change dates, places, titles, organizations, relationships, or other constraints. If the original question asks "who," "when," "where," or "what," the final subproblem must preserve that answer type.
     8. If a subproblem depends on the answer to a previous subproblem, refer to that answer clearly using phrases such as "this person," "this city," "this country," or "this entity."
     9. If the question involves comparison, aggregation, or multiple independent targets, first create subproblems for the necessary entities or values, then add a final subproblem that performs the comparison, aggregation, or judgment.
     10. If the question can be answered with a single independent lookup, output exactly one subproblem identical to the original question and mark "is_simple" as true.
+    11. If the question asks about a location, relationship, or comparison relative to two or more independently-resolvable anchor entities (e.g., "north of both [A] and [B]", "between [C] and [D]"), create a separate lookup subproblem for each anchor before the final resolution step. Do not merge multiple anchor lookups into one step. The final step must ask about the relationship relative to ALL anchors together — do not create separate "north of A" and "north of B" steps; instead, look up each anchor location first, then ask "what lies north of both these locations?"
+    12. Read the full question before decomposing. If the question contains a compound structure where the result of the first lookup is used in a different context for the second lookup (e.g., "what was [the producer of film A]'s name in [show B]"), both steps are required — do not stop at the first entity lookup and omit the contextual second step.
 
     Here are some examples:
     {QUERY_DECOMPOSITION_FEW_SHOT_EXAMPLES}
