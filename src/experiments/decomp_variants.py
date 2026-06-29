@@ -12,6 +12,7 @@ base 코드(logic_rag.py)를 수정하지 않고 decompose_query()만 override�
 """
 
 import logging
+import re
 from typing import Any, Dict, List
 
 from src.models.logic_rag import LogicRAG, QUERY_DECOMPOSITION_FEW_SHOT_EXAMPLES
@@ -120,9 +121,22 @@ class LogicRAGExpSelfVerify(LogicRAG):
     → 중간 entity가 필요하면 두 step으로 분할.
 
     타깃 오류: 패턴 1(과소분해 — 직접 답 가능처럼 보이는 2-hop)
-    추가 API 호출: subproblem 수만큼 (+N 호출)
+    추가 API 호출: 검증 대상 step 수만큼 (소유 속성 패턴 step에만 적용)
     검증은 단일 pass (무한 루프 방지)
+
+    수정 (v2):
+    - Fix 1: "X's Y" 소유 속성 패턴이 있는 step에만 검증 적용 (전체 적용 금지)
+    - Fix 2: 검증 프롬프트 재설계 — split 불필요 예시 강화, 보수적 판단 유도
+    - Fix 3: confidence 필드 추가 — high일 때만 실제 분할
     """
+
+    # "X's Y"가 직접 답의 대상이 아니라 다른 lookup의 입력으로 쓰이는 step만 검증 대상
+    # "What is X's Y?" 형태는 이미 단일 lookup이므로 제외
+    _POSSESSIVE_AS_INPUT = re.compile(r"\b\w{2,}'s\s+\w+")
+    _DIRECT_PROPERTY_LOOKUP = re.compile(
+        r"^(What|Who|Which)\s+(is|was|are|were)\s+[\w\s]+'s\s+\w+[\w\s]*\??$",
+        re.IGNORECASE,
+    )
 
     def decompose_query(self, question: str) -> Dict[str, Any]:
         # 1단계: base 클래스로 초기 분해
@@ -131,13 +145,24 @@ class LogicRAGExpSelfVerify(LogicRAG):
         if initial.get("is_simple") or not initial.get("subproblems"):
             return initial
 
-        # 2단계: 각 step 검증 및 필요시 분할
+        # 2단계: 소유 속성이 다른 lookup의 입력으로 쓰이는 step만 선별 검증
+        # "What is X's Y?" 형태는 이미 단일 lookup이므로 제외
         verified: List[Dict] = []
         for step in initial["subproblems"]:
-            check = self._verify_step(question, step["text"])
-            if check.get("needs_split") and len(check.get("steps", [])) == 2:
-                verified.append({"text": check["steps"][0]})
-                verified.append({"text": check["steps"][1]})
+            has_possessive = self._POSSESSIVE_AS_INPUT.search(step["text"])
+            is_direct_lookup = self._DIRECT_PROPERTY_LOOKUP.match(step["text"])
+            if has_possessive and not is_direct_lookup:
+                check = self._verify_step(question, step["text"])
+                # confidence == "high" 일 때만 분할
+                if (
+                    check.get("needs_split")
+                    and check.get("confidence") == "high"
+                    and len(check.get("steps", [])) == 2
+                ):
+                    verified.append({"text": check["steps"][0]})
+                    verified.append({"text": check["steps"][1]})
+                else:
+                    verified.append({"text": step["text"]})
             else:
                 verified.append({"text": step["text"]})
 
@@ -151,42 +176,51 @@ class LogicRAGExpSelfVerify(LogicRAG):
         }
 
     def _verify_step(self, question: str, step_text: str) -> Dict[str, Any]:
-        """단일 step이 직접 lookup인지, 아니면 중간 entity 탐색이 필요한지 판단한다."""
-        prompt = f"""You are checking whether a decomposition step is granular enough for single-fact retrieval.
+        """소유 속성 체인이 포함된 step이 실제로 분할이 필요한지 보수적으로 판단한다."""
+        prompt = f"""You are checking whether a decomposition step contains a possessive property chain that requires splitting.
 
 Original question: "{question}"
 Step to check: "{step_text}"
 
-Determine: can this step be answered by a SINGLE direct fact lookup (one Wikipedia-style property)?
-Or does it first require finding an intermediate entity, and then looking up a property of that entity?
+A step needs splitting ONLY when it contains "X's Y" where Y is itself used as input to the next lookup —
+meaning you must first find Y's value, and then use that value to answer another question.
 
-Examples of steps that NEED splitting:
-- "In which district was Ernie Watts born?"
-  → First find Ernie Watts's birthplace (city), THEN find which district that city is in.
+This is a HIGH bar. Most steps do NOT need splitting. Default to "needs_split": false.
+
+Examples of steps that do NOT need splitting (the vast majority):
+- "What is the capital of France?"              → single lookup, NO SPLIT
+- "Who is the mayor of Paris?"                  → single lookup, NO SPLIT
+- "In which country was the inventor born?"     → single lookup, NO SPLIT
+- "What is the population of this country?"     → single lookup, NO SPLIT
+- "When did the explorer reach this city?"      → single lookup, NO SPLIT
+- "Who directed this film?"                     → single lookup, NO SPLIT
+
+Examples of steps that DO need splitting (rare — only when X's Y feeds another lookup):
 - "Who wanted to reform John Kodwo Amissah's religion?"
-  → First find Amissah's religion, THEN find who wanted to reform that religion.
-
-Examples of steps that do NOT need splitting:
-- "What is the capital of France?"  (single lookup)
-- "Who is the mayor of Paris?"       (single lookup given Paris is already known)
+  → Must find Amissah's religion first, THEN find who wanted to reform it.
+  → SPLIT into: "What is Amissah's religion?" + "Who wanted to reform this religion?"
+- "What is the only group larger than Mankatha's record label?"
+  → Must find Mankatha's record label first, THEN find the larger group.
+  → SPLIT into: "What is Mankatha's record label?" + "What is the only group larger than this label?"
 
 Return ONLY a JSON object:
 {{
   "needs_split": true or false,
+  "confidence": "high" or "low",
   "steps": ["step A text", "step B text"]
 }}
-Note: "steps" is required only when needs_split=true. Keep step texts concise."""
+"steps" is required only when needs_split=true. "confidence" must be "high" only when you are certain splitting is needed."""
 
         try:
             response = get_response_with_retry(prompt)
             response = response.strip().replace("```json", "").replace("```", "")
             result = fix_json_response(response)
             if not isinstance(result, dict):
-                return {"needs_split": False}
+                return {"needs_split": False, "confidence": "low"}
             return result
         except Exception as e:
             logger.error(f"_verify_step error: {e}")
-            return {"needs_split": False}
+            return {"needs_split": False, "confidence": "low"}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
