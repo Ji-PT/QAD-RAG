@@ -92,8 +92,40 @@ from src.utils.utils import get_response_with_retry, fix_json_response
 
 DECOMP_EVAL_DATASET_PATH = "dataset/musique_sample_100.json"  # 평가할 데이터셋 경로
 DECOMP_EVAL_OUTPUT_DIR   = "evaluation"                        # 결과 저장 폴더
+DECOMP_EVAL_CHECKPOINT_INTERVAL = 5                            # 체크포인트 저장 간격 (샘플 수)
 
 logger = logging.getLogger(__name__)
+
+
+def _checkpoint_path(output_path: str) -> str:
+    """output 파일에 대응하는 체크포인트 파일 경로."""
+    ckpt_dir = os.path.join(os.path.dirname(output_path), "checkpoints")
+    basename = os.path.splitext(os.path.basename(output_path))[0]
+    return os.path.join(ckpt_dir, f"{basename}.checkpoint.json")
+
+
+def _save_checkpoint(results: list, output_path: str) -> None:
+    ckpt_path = _checkpoint_path(output_path)
+    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+    with open(ckpt_path, "w", encoding="utf-8") as f:
+        json.dump({"results": results, "output_path": output_path}, f, ensure_ascii=False)
+
+
+def _load_checkpoint(output_path: str) -> list:
+    ckpt_path = _checkpoint_path(output_path)
+    if os.path.exists(ckpt_path):
+        with open(ckpt_path, encoding="utf-8") as f:
+            data = json.load(f)
+        completed = data.get("results", [])
+        print(f"체크포인트 발견: {len(completed)}개 완료, 이어서 진행합니다.")
+        return completed
+    return []
+
+
+def _clear_checkpoint(output_path: str) -> None:
+    ckpt_path = _checkpoint_path(output_path)
+    if os.path.exists(ckpt_path):
+        os.remove(ckpt_path)
 
 
 def judge_step_semantic_match(model_step: str, gold_step: str) -> Dict[str, Any]:
@@ -234,6 +266,7 @@ def _next_output_path(dataset_path: str, output_dir: str) -> str:
 def run_decomposition_eval(
     dataset_path: str = DECOMP_EVAL_DATASET_PATH,
     output_path: str = None,
+    model=None,
 ) -> None:
     if output_path is None:
         output_path = _next_output_path(dataset_path, DECOMP_EVAL_OUTPUT_DIR)
@@ -241,10 +274,16 @@ def run_decomposition_eval(
     with open(dataset_path, encoding="utf-8") as f:
         dataset = json.load(f)
 
-    model = LogicRAG()
-    results = []
+    if model is None:
+        model = LogicRAG()
 
-    for item in tqdm(dataset, desc="Evaluating decomposition"):
+    # 체크포인트에서 이어 시작
+    results = _load_checkpoint(output_path)
+    completed_ids = {r["id"] for r in results}
+    remaining = [item for item in dataset if item["id"] not in completed_ids]
+
+    for i, item in enumerate(tqdm(remaining, desc="Evaluating decomposition",
+                                  initial=len(results), total=len(dataset))):
         question = item["question"]
         hop_type = item["id"].split("__")[0]
         gold_decomposition = [
@@ -279,6 +318,10 @@ def run_decomposition_eval(
             "gold_decomposition": gold_decomposition,
             **eval_result,
         })
+
+        # 체크포인트 저장
+        if (i + 1) % DECOMP_EVAL_CHECKPOINT_INTERVAL == 0:
+            _save_checkpoint(results, output_path)
 
     # 집계
     has_gold = [r for r in results if r["n_gold"] > 0]
@@ -318,6 +361,8 @@ def run_decomposition_eval(
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump({"summary": summary, "results": results}, f, ensure_ascii=False, indent=2)
+
+    _clear_checkpoint(output_path)
 
     print("\n=== Decomposition Evaluation Summary ===")
     print(f"총 샘플: {summary['total']} (gold 있음: {summary['has_gold']})")
