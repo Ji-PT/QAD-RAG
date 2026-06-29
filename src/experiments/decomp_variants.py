@@ -41,11 +41,14 @@ class LogicRAGExpEntityCoT(LogicRAG):
 
 Given a question, first identify the key intermediate entities, then decompose into subproblems.
 
-Step 1 — Identify "pivot entities": things that must be looked up explicitly as separate steps
-  because their result feeds into the next lookup. Include:
+Step 1 — Identify "pivot entities": intermediate entities that must be explicitly looked up
+  because their result feeds into the next lookup. Include ONLY:
   - Possessive properties used as input: e.g., "X's religion", "Y's record label"
   - Unnamed entities described by a relative clause: e.g., "the person who did X"
-  - Named entities whose specific attributes (location, membership, date) are needed
+  Do NOT include:
+  - Entities that are already explicitly and unambiguously named in the question
+  - Attributes that can be looked up in a single step from a named entity
+  Keep the pivot entity list as short as possible.
 
 Step 2 — Order pivot entities by dependency chain (what must come first?)
 
@@ -62,6 +65,7 @@ Rules:
 8. If the question involves comparison or multiple targets, resolve each independently first, then compare.
 9. If the question can be answered with a single lookup, output one subproblem and mark is_simple=true.
 10. If two or more anchor entities determine a final relational lookup, create a separate lookup for each anchor first.
+11. Minimize the total number of subproblems — do not add steps that are not strictly required.
 
 Here are some examples:
 {QUERY_DECOMPOSITION_FEW_SHOT_EXAMPLES}
