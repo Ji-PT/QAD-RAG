@@ -37,7 +37,7 @@ RESULT_DIR = "evaluation"
 
 DATASET = "musique"
 
-DATASET_PATH  = f"dataset/{DATASET}.json"
+DATASET_PATH  = os.getenv("EVAL_DATASET_PATH", f"dataset/{DATASET}.json")
 CORPUS_PATH   = f"dataset/{DATASET}_corpus.json"
 _RUN_TIMESTAMP = os.getenv("RUN_TIMESTAMP", datetime.now().strftime("%Y%m%d_%H%M%S"))
 OUTPUT_FILE   = f"evaluation_results_{DATASET}_{_RUN_TIMESTAMP}.json"
