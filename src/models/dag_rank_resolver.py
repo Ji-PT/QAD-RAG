@@ -1178,7 +1178,18 @@ Return ONLY a JSON object with this schema:
             )
 
             # 6. node_id 기준으로 중간 답을 저장한다.
-            for node_answer in rank_result.get("node_answers", []) or []:
+            rank_node_answers = (
+                rank_result.get("node_answers", [])
+                if isinstance(rank_result, dict)
+                else []
+            )
+            if not isinstance(rank_node_answers, list):
+                rank_node_answers = []
+
+            for node_answer in rank_node_answers:
+                if not isinstance(node_answer, dict):
+                    continue
+
                 node_id = _as_int(node_answer.get("node_id"))
                 if node_id is None:
                     continue
@@ -1258,12 +1269,69 @@ Return ONLY a JSON object with this schema:
                 or len(retrieval_history) < max_rounds
             )
 
-            if (
+            hook_base_enabled = (
                 has_round_budget_after_this
                 and dag is not None
                 and max_dynamic_adaptations > 0
                 and adaptation_count < max_dynamic_adaptations
-            ):
+            )
+
+            node_answers_for_hook = None
+            node_answers_type = "unavailable"
+            if isinstance(rank_result, dict):
+                if "node_answers" in rank_result:
+                    raw_node_answers = rank_result.get("node_answers")
+                    node_answers_type = type(raw_node_answers).__name__
+                else:
+                    raw_node_answers = None
+                    node_answers_type = "missing"
+
+                if isinstance(raw_node_answers, list):
+                    node_answers_for_hook = raw_node_answers
+            else:
+                raw_node_answers = None
+                node_answers_type = "unavailable"
+
+            malformed_node_answers_for_hook = node_answers_for_hook is None
+            if malformed_node_answers_for_hook:
+                unresolved_answers_for_hook: List[Dict[str, Any]] = []
+                node_answers_count = 0
+
+                if hook_base_enabled and progress_logger.isEnabledFor(logging.WARNING):
+                    progress_logger.warning(
+                        "Dynamic adaptation skipped: skip_reason=malformed_or_missing_node_answers | rank=%s | round=%d | rank_result_type=%s | node_answers_type=%s",
+                        rank,
+                        round_idx,
+                        type(rank_result).__name__,
+                        node_answers_type,
+                    )
+            else:
+                unresolved_answers_for_hook = [
+                    answer
+                    for answer in node_answers_for_hook
+                    if isinstance(answer, dict)
+                    and (
+                        not _as_bool(answer.get("is_answered", False))
+                        or bool(_clean_text(answer.get("missing_info", "")))
+                    )
+                ]
+                node_answers_count = len(node_answers_for_hook)
+
+                if (
+                    hook_base_enabled
+                    and not unresolved_answers_for_hook
+                    and progress_logger.isEnabledFor(logging.INFO)
+                ):
+                    progress_logger.info(
+                        "Dynamic adaptation skipped: no explicit unresolved node in current rank | rank=%s | round=%d | node_answers_count=%d | adaptation_count=%d | max_dynamic_adaptations=%d",
+                        rank,
+                        round_idx,
+                        node_answers_count,
+                        adaptation_count,
+                        max_dynamic_adaptations,
+                    )
+
+            if hook_base_enabled and len(unresolved_answers_for_hook) > 0:
                 # 부모 rank 조회용으로 현재까지의 max rank 계산
                 current_max_rank = max(
                     (int(g["rank"]) for g in rank_groups_to_process),
@@ -1279,16 +1347,6 @@ Return ONLY a JSON object with this schema:
                     answer_text = _clean_text(answer_dict.get("answer", ""))
                     if answer_text:
                         sub_answers_for_hook[node_id] = answer_text
-
-                unresolved_answers_for_hook = [
-                    answer
-                    for answer in rank_result.get("node_answers", []) or []
-                    if isinstance(answer, dict)
-                    and (
-                        not _as_bool(answer.get("is_answered", False))
-                        or bool(_clean_text(answer.get("missing_info", "")))
-                    )
-                ]
 
                 try:
                     new_sub_info = self.rag._maybe_add_subproblem(

@@ -513,9 +513,15 @@ Output schema:
             )
             return None
 
-        if self._match_node_id_by_text(dag, new_text) is not None:
+        duplicate_node_id = self._match_node_id_by_text(dag, new_text)
+        if duplicate_node_id is not None:
+            duplicate_node_text = dag.V[duplicate_node_id].text
             logger.warning(
-                f"{Fore.YELLOW}Dynamic adaptation: new subproblem duplicates an existing one. Skip.{Style.RESET_ALL}"
+                f"{Fore.YELLOW}Dynamic adaptation: new subproblem duplicates an existing one. "
+                f"Skip. current_rank={current_rank} "
+                f"new_subproblem_text={new_text!r} "
+                f"duplicate_node_id={duplicate_node_id} "
+                f"duplicate_node_text={duplicate_node_text!r}{Style.RESET_ALL}"
             )
             return None
 
