@@ -293,6 +293,7 @@ def run_decomposition_eval(
 
         decomp = model.decompose_query(question)
         model_subproblems = decomp.get("subproblems", [])
+        model_dependencies = decomp.get("dependencies", [])
         is_simple = decomp.get("is_simple", False)
 
         if gold_decomposition:
@@ -315,6 +316,7 @@ def run_decomposition_eval(
             "gold_answer": item["answer"],
             "is_simple": is_simple,
             "model_subproblems": model_subproblems,
+            "model_dependencies": model_dependencies,
             "gold_decomposition": gold_decomposition,
             **eval_result,
         })

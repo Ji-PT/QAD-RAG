@@ -7,6 +7,8 @@ base 코드(logic_rag.py)를 수정하지 않고 decompose_query()만 override�
   LogicRAGExpEntityCoT   — 실험 1: pivot entity 먼저 식별 후 분해 (CoT)
   LogicRAGExpSelfVerify  — 실험 2: 분해 후 각 step 자기검증 + 분할
   LogicRAGExpHopCount    — 실험 3: hop count 사전 추정 후 분해
+  LogicRAGExpDependencyAwareDecomp
+                         — 실험 4: decomposition 단계에서 draft dependency 함께 예측
 
 실행은 run_decomp_experiments.py 참고.
 """
@@ -19,6 +21,153 @@ from src.models.logic_rag import LogicRAG, QUERY_DECOMPOSITION_FEW_SHOT_EXAMPLES
 from src.utils.utils import get_response_with_retry, fix_json_response
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 실험 4: Dependency-aware decomposition (B1)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class LogicRAGExpDependencyAwareDecomp(LogicRAG):
+    """
+    실험 4 — subproblem과 draft dependency를 함께 생성한다.
+
+    B1 범위:
+    - dependencies는 저장/분석용으로만 반환한다.
+    - DAG builder, edge inference, rank 계산에는 사용하지 않는다.
+    - 기존 decomposition metric은 subproblems만으로 계산한다.
+    """
+
+    def decompose_query(self, question: str) -> Dict[str, Any]:
+        try:
+            prompt = f"""You are an expert at decomposing complex questions into smaller, logically ordered subproblems.
+
+    Given a question, decompose it into the minimum number of subproblems needed to answer it.
+
+    Rules:
+        1. Each subproblem must ask for exactly one factual lookup target: one entity, attribute, location, date, number, or other value.
+        2. Create a new subproblem only when its result is needed as input for another subproblem or directly needed for the final answer.
+        3. Do not add background, context, explanation, or verification steps that are not strictly necessary to reach the final answer.
+        4. If an entity or value must be found before it can be used in another lookup, create a separate subproblem for that intermediate entity or value. This includes possessive property chains: if "X's Y" is used as input for a later lookup, then "What is X's Y?" must be its own subproblem. Never combine the intermediate lookup with the step that uses it.
+        5. If an entity is already explicitly named in the question and the question only requires one direct attribute of that entity, treat it as a single subproblem. Do not split a direct attribute lookup into multiple subproblems. For example, "Where was X born?" should not be split into "Who is X?" and "Where was X born?"
+            Note: Rule 5 applies only when the direct attribute is the final answer. If an unknown property or relation of an explicitly named entity is needed as input for a later lookup, create one separate subproblem for that property or relation before the subproblem that uses it.
+        6. Do not decompose descriptive modifiers unless they are required to identify the target entity. Keep modifiers such as "recently abdicated," "famous," "largest," or "first" as constraints only when they are necessary to find the correct entity.
+        7. Each subproblem must preserve the original question's intent, key terms, constraints, and expected answer type. Do not remove or change dates, places, titles, organizations, relationships, or other constraints. If the original question asks "who," "when," "where," or "what," the final subproblem must preserve that answer type.
+        8. If a subproblem uses an entity or value introduced by another subproblem, refer to that unknown result symbolically and unambiguously. Do not assume the actual answer during decomposition. For a single referenced result, use a typed phrase such as "this person", "this city", "this country", "this date", or "this entity". For multiple referenced results used together, use clear plural phrases such as "these two countries", "these two dates", "these locations", or "these entities". Avoid ambiguous singular references such as "this country" or "this entity" when more than one result of the same type is involved. Do not include formal dependency labels or step-id references in the subproblem text. The subproblem text should remain a natural-language question.
+        9. If the question involves comparison, aggregation, judgment, or a final relation that depends on multiple independent entities or values, first create subproblems for the necessary entities or values, then add a final subproblem that performs the comparison, aggregation, judgment, or relation.
+        10. If the question can be answered with a single independent lookup, output exactly one subproblem identical to the original question and mark "is_simple" as true.
+        11. If the question asks about a location, relationship, or comparison involving two or more independently resolvable entities or values, create a separate lookup subproblem for each required entity or value before the final resolution step. Do not merge multiple independent lookups into one step. The final step must use all required entities or values together.
+        12. Read the full question before decomposing. If the question contains a compound structure where the result of the first lookup is used in a different context for the second lookup, both steps are required. Do not stop at the first entity lookup and omit the contextual second step.
+
+    After creating the subproblems, also draft direct dependency edges among them for analysis.
+    A dependency edge A -> B means B cannot be answered without the result of A.
+    Do not create dependencies from subproblem order or id order alone.
+    Do not connect independent subproblems, even if both are needed for a later comparison, aggregation, judgment, or relation.
+    For comparison, aggregation, judgment, or relation subproblems, connect each required input subproblem directly to that final subproblem.
+    Do not add redundant transitive dependencies.
+
+    Here are some examples:
+    {QUERY_DECOMPOSITION_FEW_SHOT_EXAMPLES}
+
+    Now decompose the following question:
+    Question: "{question}"
+
+    Please format your response as a JSON object with these keys:
+
+    * "subproblems": list of objects, each with "id" (int) and "text" (string)
+    * "dependencies": list of objects, each with "prerequisite_id" (int), "dependent_id" (int), and "reason" (string)
+    * "is_simple": boolean
+
+    Respond ONLY with the JSON object, no additional text."""
+
+            response = get_response_with_retry(prompt)
+            response = response.strip().replace("```json", "").replace("```", "")
+            result = fix_json_response(response)
+
+            if result is None:
+                return {
+                    "subproblems": [{"id": 0, "text": question}],
+                    "dependencies": [],
+                    "is_simple": True,
+                }
+
+            if (
+                "subproblems" not in result
+                or not isinstance(result["subproblems"], list)
+                or len(result["subproblems"]) == 0
+            ):
+                result["subproblems"] = [{"id": 0, "text": question}]
+
+            if "is_simple" not in result:
+                result["is_simple"] = len(result["subproblems"]) <= 1
+
+            dependencies = self._normalize_dependencies(
+                result.get("dependencies", []),
+                result["subproblems"],
+            )
+
+            return {
+                "subproblems": result["subproblems"],
+                "dependencies": dependencies,
+                "is_simple": result["is_simple"],
+            }
+
+        except Exception as e:
+            logger.error(f"LogicRAGExpDependencyAwareDecomp.decompose_query error: {e}")
+            return {
+                "subproblems": [{"id": 0, "text": question}],
+                "dependencies": [],
+                "is_simple": True,
+            }
+
+    @staticmethod
+    def _normalize_dependencies(
+        raw_dependencies: Any,
+        subproblems: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(raw_dependencies, list):
+            return []
+
+        valid_ids = set()
+        for subproblem in subproblems:
+            if not isinstance(subproblem, dict):
+                continue
+            try:
+                node_id = int(subproblem.get("id"))
+            except (TypeError, ValueError):
+                continue
+            valid_ids.add(node_id)
+
+        normalized: List[Dict[str, Any]] = []
+        seen_edges = set()
+
+        for raw_dependency in raw_dependencies:
+            if not isinstance(raw_dependency, dict):
+                continue
+
+            try:
+                prerequisite_id = int(raw_dependency.get("prerequisite_id"))
+                dependent_id = int(raw_dependency.get("dependent_id"))
+            except (TypeError, ValueError):
+                continue
+
+            if prerequisite_id == dependent_id:
+                continue
+
+            if prerequisite_id not in valid_ids or dependent_id not in valid_ids:
+                continue
+
+            edge_key = (prerequisite_id, dependent_id)
+            if edge_key in seen_edges:
+                continue
+            seen_edges.add(edge_key)
+
+            normalized.append({
+                "prerequisite_id": prerequisite_id,
+                "dependent_id": dependent_id,
+                "reason": str(raw_dependency.get("reason", "")).strip(),
+            })
+
+        return normalized
 
 
 # ──────────────────────────────────────────────────────────────────────────────
