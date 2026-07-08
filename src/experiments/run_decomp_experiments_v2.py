@@ -19,14 +19,18 @@ from src.evaluation.decomposition_eval import (
     DECOMP_EVAL_OUTPUT_DIR,
     run_decomposition_eval,
 )
-from src.experiments.decomp_variants_v2 import LogicRAGExpQueryTypeClassifier
+from src.experiments.decomp_variants_v2 import (
+    LogicRAGExpQueryTypeClassifier,
+    LogicRAGExpQueryTypeClassifierShortFewshot,
+    LogicRAGExpQueryTypeClassifierMidFewshot,
+)
 
 EXPERIMENTS_DATASET_PATH = DECOMP_EVAL_DATASET_PATH
 EXPERIMENTS_OUTPUT_DIR   = DECOMP_EVAL_OUTPUT_DIR
 BASELINE_FILE            = "evaluation/decomposition_eval_results_100_1.json"
 
 EXPERIMENTS = [
-    ("query_type_clf", LogicRAGExpQueryTypeClassifier, "실험 4: Query Type Classifier"),
+    ("query_type_clf_mid", LogicRAGExpQueryTypeClassifierMidFewshot, "실험 4c: Query Type Classifier (Mid Few-shot)"),
 ]
 
 
@@ -60,6 +64,8 @@ def _print_comparison(results: list[tuple[str, str]]) -> None:
         "Exp1 EntityCoT v1":    "evaluation/decomp_exp_entity_cot_100_1.json",
         "Exp2 SelfVerify v2":   "evaluation/decomp_exp_self_verify_100_2.json",
         "Exp3 HopCount":        "evaluation/decomp_exp_hop_count_100_1.json",
+        "Exp4 QueryTypeClf v2": "evaluation/decomp_exp_query_type_clf_100_2.json",
+        "Exp4b Short Fewshot":  "evaluation/decomp_exp_query_type_clf_short_100_1.json",
     }
     for label, path in prev_files.items():
         if os.path.exists(path):
