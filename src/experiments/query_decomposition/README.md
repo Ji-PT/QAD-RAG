@@ -22,6 +22,7 @@ step 수 / step 내용 / holistic 일치율)를 사용.
 | 실험 | step수 | 내용 | holistic |
 |---|---|---|---|
 | baseline | 70.0% | 44.0% | 83.0% |
+| baseline 1b | 75.0% | 46.0% | 88.0% |
 | exp1 EntityCoT | 70.0% | 47.0% | 86.0% |
 | exp2 SelfVerify | 69.0% | 48.0% | 86.0% |
 | exp3 HopCount | 69.0% | 46.0% | 83.0% |
@@ -31,6 +32,9 @@ step 수 / step 내용 / holistic 일치율)를 사용.
 | exp5 No Classifier | 69.0% | 48.0% | 85.0% |
 
 (exp4c가 세 지표 모두에서 가장 우수해 이후 실험(모듈2)의 baseline으로 채택)
+
+> baseline 1b: baseline 프롬프트가 보완된(87223f0, 0dfbe44) 이후 실험(지민언니). 
+> 결과 파일(`decomposition_eval_results_100_1.json`, 70.0/44.0/83.0)은 보완 전 버전 그대로 남아있다.
 
 ## 실행
 
