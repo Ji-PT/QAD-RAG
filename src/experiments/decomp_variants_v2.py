@@ -2,9 +2,20 @@
 decompose_query() 프롬프트 실험용 LogicRAG 서브클래스 (exp4).
 
 실험:
-  LogicRAGExpQueryTypeClassifier — 실험 4: 질문 구조 유형 분류 후 유형별 최적화된 분해 전략 적용
-  chain      — A→B→...→Z 순차 체인, ~87% (fallback)
-  branching  — 독립 root 복수 개 → 병합 (+ 병합 후 체인 가능), ~13%
+  LogicRAGExpQueryTypeClassifier              — 실험 4: 질문 구조(chain/branching) 분류 후
+                                                 유형별 프롬프트로 분해 (baseline 8-shot 그대로 사용)
+  LogicRAGExpQueryTypeClassifierShortFewshot  — 실험 4b: few-shot을 유형별 핵심 예시만 남기고
+                                                 과감히 축소. branching 성능이 급락해 baseline
+                                                 수준으로 회귀 — 실패 사례로 참고용 유지
+  LogicRAGExpQueryTypeClassifierMidFewshot    — 실험 4c: 4b의 실패를 보고 branching에 rule 4·5
+                                                 예시(nested chain / direct attribute)를 다시 추가.
+                                                 원본과 동등하거나 더 나은 성능이면서 branching
+                                                 프롬프트 길이는 -13.8%
+
+100개 데이터셋 기준 결과 (step수 / 내용 / holistic 일치율):
+  exp4  (원본)   75.0% / 48.0% / 88.0%
+  exp4b (short)  69.0% / 49.0% / 84.0%
+  exp4c (mid)    76.0% / 52.0% / 88.0%
 
 실행:
   python -m src.experiments.run_decomp_experiments_v2
@@ -412,6 +423,9 @@ _TYPE_PROMPTS_MID: Dict[str, str] = {
 # ──────────────────────────────────────────────────────────────────────────────
 
 class LogicRAGExpQueryTypeClassifier(LogicRAG):
+    # 서브클래스는 few-shot 세트만 바꾸고 싶을 때 이 두 클래스 속성만 override하면 된다.
+    _type_prompts: Dict[str, str] = _TYPE_PROMPTS
+    _default_prompt: str = _CHAIN_PROMPT
 
     def decompose_query(self, question: str) -> Dict[str, Any]:
         q_type = self._classify_structure_type(question)
@@ -443,7 +457,7 @@ Return ONLY a JSON object: {{"type": "<chain|branching>", "reason": "one sentenc
             response = get_response_with_retry(prompt)
             response = response.strip().replace("```json", "").replace("```", "")
             result = fix_json_response(response)
-            if isinstance(result, dict) and result.get("type") in _TYPE_PROMPTS:
+            if isinstance(result, dict) and result.get("type") in self._type_prompts:
                 return result["type"]
         except Exception as e:
             logger.error(f"_classify_structure_type error: {e}")
@@ -455,7 +469,7 @@ Return ONLY a JSON object: {{"type": "<chain|branching>", "reason": "one sentenc
     def _decompose_by_type(self, question: str, q_type: str) -> Dict[str, Any]:
         # 프롬프트 안에 few-shot JSON 예제의 리터럴 중괄호가 섞여 있어 .format()은
         # 쓸 수 없다 (모든 "{...}"를 필드로 해석해 KeyError 발생) — 단순 치환 사용.
-        prompt = _TYPE_PROMPTS.get(q_type, _CHAIN_PROMPT).replace("{question}", question)
+        prompt = self._type_prompts.get(q_type, self._default_prompt).replace("{question}", question)
 
         try:
             response = get_response_with_retry(prompt)
@@ -486,69 +500,17 @@ Return ONLY a JSON object: {{"type": "<chain|branching>", "reason": "one sentenc
 
 
 class LogicRAGExpQueryTypeClassifierMidFewshot(LogicRAGExpQueryTypeClassifier):
-    """실험 4c: 4b(short)에서 branching 성능이 떨어진 것을 보고, branching에
-    rule 4·5 예시 2개(nested chain / direct attribute)를 다시 추가한 중간 버전."""
+    """실험 4c: 4b(short)에서 branching에 
+    rule 4·5 예시 2개(nested chain / direct attribute)를 다시 추가한 중간 버전.
+    원본과 동등하거나 더 나은 성능이면서 프롬프트는 더 짧은 결과"""
 
-    def _decompose_by_type(self, question: str, q_type: str) -> Dict[str, Any]:
-        prompt = _TYPE_PROMPTS_MID.get(q_type, _CHAIN_PROMPT_SHORT).replace("{question}", question)
-
-        try:
-            response = get_response_with_retry(prompt)
-            response = response.strip().replace("```json", "").replace("```", "")
-            result = fix_json_response(response)
-
-            if result is None:
-                return {"subproblems": [{"id": 0, "text": question}], "is_simple": True}
-
-            if (
-                "subproblems" not in result
-                or not isinstance(result["subproblems"], list)
-                or len(result["subproblems"]) == 0
-            ):
-                result["subproblems"] = [{"id": 0, "text": question}]
-
-            if "is_simple" not in result:
-                result["is_simple"] = len(result["subproblems"]) <= 1
-
-            return {
-                "subproblems": result["subproblems"],
-                "is_simple": result["is_simple"],
-            }
-
-        except Exception as e:
-            logger.error(f"_decompose_by_type error (type={q_type}): {e}")
-            return {"subproblems": [{"id": 0, "text": question}], "is_simple": True}
+    _type_prompts = _TYPE_PROMPTS_MID
+    _default_prompt = _CHAIN_PROMPT_SHORT
 
 
 class LogicRAGExpQueryTypeClassifierShortFewshot(LogicRAGExpQueryTypeClassifier):
-    """실험 4b: exp4와 rule은 동일, few-shot만 유형별로 추려서 프롬프트 길이를 줄인 버전."""
+    """실험 4b: exp4와 rule은 동일, few-shot만 유형별로 추려서 프롬프트 길이를 줄인 버전.
+    branching 성능이 baseline 수준으로 급락한 실패 사례. 참고용으로 유지."""
 
-    def _decompose_by_type(self, question: str, q_type: str) -> Dict[str, Any]:
-        prompt = _TYPE_PROMPTS_SHORT.get(q_type, _CHAIN_PROMPT_SHORT).replace("{question}", question)
-
-        try:
-            response = get_response_with_retry(prompt)
-            response = response.strip().replace("```json", "").replace("```", "")
-            result = fix_json_response(response)
-
-            if result is None:
-                return {"subproblems": [{"id": 0, "text": question}], "is_simple": True}
-
-            if (
-                "subproblems" not in result
-                or not isinstance(result["subproblems"], list)
-                or len(result["subproblems"]) == 0
-            ):
-                result["subproblems"] = [{"id": 0, "text": question}]
-
-            if "is_simple" not in result:
-                result["is_simple"] = len(result["subproblems"]) <= 1
-
-            return {
-                "subproblems": result["subproblems"],
-                "is_simple": result["is_simple"],
-            }
-
-        except Exception as e:
-            logger.error(f"_decompose_by_type error (type={q_type}): {e}")
-            return {"subproblems": [{"id": 0, "text": question}], "is_simple": True}
+    _type_prompts = _TYPE_PROMPTS_SHORT
+    _default_prompt = _CHAIN_PROMPT_SHORT
