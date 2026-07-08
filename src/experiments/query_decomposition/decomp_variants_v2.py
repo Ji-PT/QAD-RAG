@@ -18,7 +18,7 @@ decompose_query() 프롬프트 실험용 LogicRAG 서브클래스 (exp4).
   exp4c (mid)    76.0% / 52.0% / 88.0%
 
 실행:
-  python -m src.experiments.run_decomp_experiments_v2
+  python -m src.experiments.query_decomposition.run_decomp_experiments_v2
 """
 
 import logging
