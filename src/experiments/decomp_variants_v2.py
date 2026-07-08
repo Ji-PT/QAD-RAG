@@ -514,3 +514,44 @@ class LogicRAGExpQueryTypeClassifierShortFewshot(LogicRAGExpQueryTypeClassifier)
 
     _type_prompts = _TYPE_PROMPTS_SHORT
     _default_prompt = _CHAIN_PROMPT_SHORT
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 실험 5: No Classifier — Branching 프롬프트 단독 사용
+#
+# 구조 분류 단계 자체를 없애고 branching(mid) 프롬프트 하나만 모든 질문에 써도 exp4c와 비슷한 성능이 나오는지 검증
+# 맞다면 LLM 호출이 2번→1번으로 줄어 분류 단계의 지연/비용/오분류 리스크를 통째로 제거할 수 있다.
+# ──────────────────────────────────────────────────────────────────────────────
+
+class LogicRAGExpBranchingOnly(LogicRAG):
+    """실험 5: classifier 없이 branching(mid) 프롬프트 하나만 모든 질문에 적용."""
+
+    def decompose_query(self, question: str) -> Dict[str, Any]:
+        prompt = _BRANCHING_PROMPT_MID.replace("{question}", question)
+
+        try:
+            response = get_response_with_retry(prompt)
+            response = response.strip().replace("```json", "").replace("```", "")
+            result = fix_json_response(response)
+
+            if result is None:
+                return {"subproblems": [{"id": 0, "text": question}], "is_simple": True}
+
+            if (
+                "subproblems" not in result
+                or not isinstance(result["subproblems"], list)
+                or len(result["subproblems"]) == 0
+            ):
+                result["subproblems"] = [{"id": 0, "text": question}]
+
+            if "is_simple" not in result:
+                result["is_simple"] = len(result["subproblems"]) <= 1
+
+            return {
+                "subproblems": result["subproblems"],
+                "is_simple": result["is_simple"],
+            }
+
+        except Exception as e:
+            logger.error(f"decompose_query error: {e}")
+            return {"subproblems": [{"id": 0, "text": question}], "is_simple": True}

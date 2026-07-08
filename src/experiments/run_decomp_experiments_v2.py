@@ -23,6 +23,7 @@ from src.experiments.decomp_variants_v2 import (
     LogicRAGExpQueryTypeClassifier,
     LogicRAGExpQueryTypeClassifierShortFewshot,
     LogicRAGExpQueryTypeClassifierMidFewshot,
+    LogicRAGExpBranchingOnly,
 )
 
 EXPERIMENTS_DATASET_PATH = DECOMP_EVAL_DATASET_PATH
@@ -30,7 +31,7 @@ EXPERIMENTS_OUTPUT_DIR   = DECOMP_EVAL_OUTPUT_DIR
 BASELINE_FILE            = "evaluation/decomposition_eval_results_100_1.json"
 
 EXPERIMENTS = [
-    ("query_type_clf_mid", LogicRAGExpQueryTypeClassifierMidFewshot, "실험 4c: Query Type Classifier (Mid Few-shot)"),
+    ("branching_only", LogicRAGExpBranchingOnly, "실험 5: No Classifier (Branching 프롬프트 단독)"),
 ]
 
 
@@ -66,6 +67,8 @@ def _print_comparison(results: list[tuple[str, str]]) -> None:
         "Exp3 HopCount":        "evaluation/decomp_exp_hop_count_100_1.json",
         "Exp4 QueryTypeClf v2": "evaluation/decomp_exp_query_type_clf_100_2.json",
         "Exp4b Short Fewshot":  "evaluation/decomp_exp_query_type_clf_short_100_1.json",
+        "Exp4c Mid Fewshot":    "evaluation/decomp_exp_query_type_clf_mid_100_1.json",
+        "Exp5 No Classifier":   "evaluation/decomp_exp_branching_only_100_1.json",
     }
     for label, path in prev_files.items():
         if os.path.exists(path):
