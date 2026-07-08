@@ -295,6 +295,7 @@ def run_decomposition_eval(
         model_subproblems = decomp.get("subproblems", [])
         model_dependencies = decomp.get("dependencies", [])
         is_simple = decomp.get("is_simple", False)
+        query_type = decomp.get("query_type")
 
         if gold_decomposition:
             eval_result = evaluate_decomposition(question, model_subproblems, gold_decomposition)
@@ -309,7 +310,7 @@ def run_decomposition_eval(
                 "holistic_reason": "no gold decomposition",
             }
 
-        results.append({
+        result_entry = {
             "id": item["id"],
             "hop_type": hop_type,
             "question": question,
@@ -319,7 +320,10 @@ def run_decomposition_eval(
             "model_dependencies": model_dependencies,
             "gold_decomposition": gold_decomposition,
             **eval_result,
-        })
+        }
+        if query_type is not None:
+            result_entry["query_type"] = query_type
+        results.append(result_entry)
 
         # 체크포인트 저장
         if (i + 1) % DECOMP_EVAL_CHECKPOINT_INTERVAL == 0:
@@ -338,6 +342,23 @@ def run_decomposition_eval(
             by_hop[hop]["all_steps"] += 1
         if r["holistic_match"]:
             by_hop[hop]["holistic"] += 1
+
+    # query_type(chain/branching) 집계 — classifier가 있는 모델에서만 채워짐
+    by_query_type: Dict[str, Dict[str, int]] = {}
+    for r in results:
+        q_type = r.get("query_type")
+        if q_type is None:
+            continue
+        by_query_type.setdefault(q_type, {"total": 0, "step_count": 0, "all_steps": 0, "holistic": 0})
+        by_query_type[q_type]["total"] += 1
+        if r.get("n_gold", 0) == 0:
+            continue
+        if r["step_count_match"]:
+            by_query_type[q_type]["step_count"] += 1
+        if r["all_steps_match"]:
+            by_query_type[q_type]["all_steps"] += 1
+        if r["holistic_match"]:
+            by_query_type[q_type]["holistic"] += 1
 
     def pct(n, d):
         return round(n / d * 100, 1) if d else 0.0
@@ -360,6 +381,17 @@ def run_decomposition_eval(
         },
     }
 
+    if by_query_type:
+        summary["by_query_type"] = {
+            q_type: {
+                "total": v["total"],
+                "step_count_match_rate": pct(v["step_count"], v["total"]),
+                "all_steps_match_rate": pct(v["all_steps"], v["total"]),
+                "holistic_match_rate": pct(v["holistic"], v["total"]),
+            }
+            for q_type, v in sorted(by_query_type.items())
+        }
+
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump({"summary": summary, "results": results}, f, ensure_ascii=False, indent=2)
@@ -374,6 +406,10 @@ def run_decomposition_eval(
     print("\nhop별:")
     for hop, v in summary["by_hop"].items():
         print(f"  {hop:8s} | step수={v['step_count_match_rate']}% | 내용={v['all_steps_match_rate']}% | holistic={v['holistic_match_rate']}% (n={v['total']})")
+    if "by_query_type" in summary:
+        print("\nquery_type별 (classifier 예측):")
+        for q_type, v in summary["by_query_type"].items():
+            print(f"  {q_type:10s} | step수={v['step_count_match_rate']}% | 내용={v['all_steps_match_rate']}% | holistic={v['holistic_match_rate']}% (n={v['total']})")
     print(f"\n결과 저장: {output_path}")
 
 

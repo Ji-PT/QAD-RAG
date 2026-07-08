@@ -158,7 +158,9 @@ class LogicRAGExpQueryTypeClassifier(LogicRAG):
 
     def decompose_query(self, question: str) -> Dict[str, Any]:
         q_type = self._classify_structure_type(question)
+        logger.info(f"[classify] {q_type}: {question[:80]}")
         result = self._decompose_by_type(question, q_type)
+        result["query_type"] = q_type
         return result
 
     # ── Step 1: 구조 유형 분류 ────────────────────────────────────────────────
